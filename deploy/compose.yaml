@@ -1,0 +1,26 @@
+# Maintainer/dev compose: build from this checkout.
+# End users should prefer docker-compose.yml (pull-only).
+
+name: buddy-api-mock
+
+services:
+  api-mock:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${API_MOCK_IMAGE:-docker.io/ramudaderuta/buddy-api-mock:latest}
+    pull_policy: missing
+    container_name: buddy-api-mock
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      API_MOCK_LISTEN: 127.0.0.1:13100
+      API_MOCK_DATA_DIR: /data
+      API_MOCK_ADMIN_PASSWORD: ${API_MOCK_ADMIN_PASSWORD:?set API_MOCK_ADMIN_PASSWORD in .env}
+      API_MOCK_API_KEY: ${API_MOCK_API_KEY:?set API_MOCK_API_KEY in .env}
+      API_MOCK_WORKBUDDY_USER_ID: ${API_MOCK_WORKBUDDY_USER_ID:-}
+    volumes:
+      - api-mock-data:/data
+
+volumes:
+  api-mock-data:

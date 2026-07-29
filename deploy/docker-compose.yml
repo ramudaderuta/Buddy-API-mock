@@ -1,0 +1,32 @@
+# Buddy-API-mock — private local deployment (image only, no source required)
+# Usage:
+#   cp .env.example .env   # set admin password + relay API key
+#   docker compose pull
+#   docker compose up -d
+#
+# UI:  http://127.0.0.1:13100
+# API: http://127.0.0.1:13100/v1/chat/completions
+#      Authorization: Bearer <API_MOCK_API_KEY>
+# Do not expose this listener on a public interface.
+
+name: buddy-api-mock
+
+services:
+  api-mock:
+    image: ${API_MOCK_IMAGE:-docker.io/ramudaderuta/buddy-api-mock:latest}
+    pull_policy: always
+    container_name: buddy-api-mock
+    restart: unless-stopped
+    # Host networking so 127.0.0.1:13100 binds the host loopback directly.
+    network_mode: host
+    environment:
+      API_MOCK_LISTEN: 127.0.0.1:13100
+      API_MOCK_DATA_DIR: /data
+      API_MOCK_ADMIN_PASSWORD: ${API_MOCK_ADMIN_PASSWORD:?set API_MOCK_ADMIN_PASSWORD in .env}
+      API_MOCK_API_KEY: ${API_MOCK_API_KEY:?set API_MOCK_API_KEY in .env}
+      API_MOCK_WORKBUDDY_USER_ID: ${API_MOCK_WORKBUDDY_USER_ID:-}
+    volumes:
+      - api-mock-data:/data
+
+volumes:
+  api-mock-data:
