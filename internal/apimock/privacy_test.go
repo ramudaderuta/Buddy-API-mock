@@ -136,6 +136,8 @@ func TestNativeWorkBuddyConversationPreservesClientProfile(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	request.Header.Set("X-Agent-Purpose", "conversation")
 	request.Header.Set("X-CodeBuddy-Request", "1")
+	request.Header.Set("User-Agent", "WorkBuddy/5.3.5")
+	request.Header.Set("X-IDE-Name", "WorkBuddy")
 	payload := map[string]any{"tools": make([]any, 20)}
 	if !isNativeWorkBuddyConversation(request, payload) {
 		t.Fatal("expected a complete native WorkBuddy request to be preserved")
@@ -146,6 +148,8 @@ func TestNativeWorkBuddyConversationDetectsClientProfile(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	request.Header.Set("X-Agent-Purpose", "conversation")
 	request.Header.Set("X-CodeBuddy-Request", "1")
+	request.Header.Set("User-Agent", "WorkBuddy/5.3.5")
+	request.Header.Set("X-IDE-Name", "WorkBuddy")
 	payload := map[string]any{"model": "client-model", "tools": make([]any, 20)}
 	if !isNativeWorkBuddyConversation(request, payload) {
 		t.Fatalf("native WorkBuddy profile was not detected: %#v", payload)
@@ -170,6 +174,29 @@ func TestIncompleteWorkBuddyConversationUsesRelayProfile(t *testing.T) {
 	payload := map[string]any{"tools": make([]any, 1)}
 	if isNativeWorkBuddyConversation(request, payload) {
 		t.Fatal("incomplete client profile must use the relay profile")
+	}
+}
+
+func TestOnlyNativeWorkBuddyCanPreserveCallerFingerprint(t *testing.T) {
+	for _, caller := range []struct {
+		name      string
+		userAgent string
+		ideName   string
+	}{
+		{name: "agent client", userAgent: "agent-client/1.0", ideName: "Agent Client"},
+		{name: "unknown client", userAgent: "custom-client/1.0", ideName: "Custom Client"},
+	} {
+		t.Run(caller.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			request.Header.Set("X-Agent-Purpose", "conversation")
+			request.Header.Set("X-CodeBuddy-Request", "1")
+			request.Header.Set("User-Agent", caller.userAgent)
+			request.Header.Set("X-IDE-Name", caller.ideName)
+
+			if isNativeWorkBuddyConversation(request, map[string]any{"tools": make([]any, 20)}) {
+				t.Fatal("non-WorkBuddy caller must use the generated WorkBuddy profile")
+			}
+		})
 	}
 }
 

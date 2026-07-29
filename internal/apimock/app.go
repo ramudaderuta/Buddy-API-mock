@@ -562,6 +562,9 @@ func isNativeWorkBuddyConversation(r *http.Request, request map[string]any) bool
 	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Agent-Purpose")), "conversation") || strings.TrimSpace(r.Header.Get("X-CodeBuddy-Request")) != "1" {
 		return false
 	}
+	if !strings.HasPrefix(strings.TrimSpace(r.Header.Get("User-Agent")), "WorkBuddy/") || !strings.EqualFold(strings.TrimSpace(r.Header.Get("X-IDE-Name")), "WorkBuddy") {
+		return false
+	}
 	tools, ok := request["tools"].([]any)
 	return ok && len(tools) >= 20
 }
