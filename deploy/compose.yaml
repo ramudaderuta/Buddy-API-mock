@@ -23,6 +23,7 @@ services:
       API_MOCK_WORKBUDDY_PROFILE_FILE: ${API_MOCK_WORKBUDDY_PROFILE_FILE:-}
     volumes:
       - api-mock-data:/data
+      - ${API_MOCK_PRIVATE_PROFILE_DIR:-./.private/workbuddy-profile}:/private-profile:ro
 
 volumes:
   api-mock-data:

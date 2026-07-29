@@ -56,8 +56,9 @@ cp .env.example .env
 | `API_MOCK_ADMIN_PASSWORD` | 控制台管理员密码（**必填**）。只来自环境变量，**不会**写入 data 卷。 |
 | `API_MOCK_API_KEY` | 转发服务 API Key（**必填**）。客户端调用 `/v1/chat/completions` 时使用；**不是**上游账户密钥。 |
 | `API_MOCK_WORKBUDDY_USER_ID` | 可选。仅转发给上游的 WorkBuddy 用户标识；保留在本机 `.env`，不要提交。 |
-| `API_MOCK_MODEL_INSTRUCTIONS_FILE` | 可选。容器内私有系统提示词文件。普通 agent 请求使用它构造 WorkBuddy 画像；文件只放在部署机数据卷，不能提交或复制进镜像。 |
-| `API_MOCK_WORKBUDDY_PROFILE_FILE` | 可选。容器内私有 WorkBuddy 请求头画像。普通 agent 请求使用其中白名单头；文件只放在部署机数据卷，不能提交或复制进镜像。 |
+| `API_MOCK_PRIVATE_PROFILE_DIR` | 可选。宿主机私有画像目录；以只读方式挂载到容器 `/private-profile`。默认是 `deploy/.private/workbuddy-profile`。 |
+| `API_MOCK_MODEL_INSTRUCTIONS_FILE` | 可选。容器内私有系统提示词路径。普通 agent 请求使用它构造 WorkBuddy 画像。 |
+| `API_MOCK_WORKBUDDY_PROFILE_FILE` | 可选。容器内私有 WorkBuddy 请求头画像路径。普通 agent 请求使用其中白名单头。 |
 | `API_MOCK_IMAGE` | 可选。默认 `docker.io/ramudaderuta/buddy-api-mock:latest`。 |
 
 ### 2. 启动
@@ -99,31 +100,19 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13100/
    }
    ```
 
-将这两个文件放在一个仅当前用户可读的本地目录，例如 `./.private/workbuddy-profile`，然后写入 Docker
-数据卷。下面的命令只复制文件，不会输出它们的内容：
+在 `deploy/` 下直接创建宿主机私有目录并放入这两个文件：
 
 ```bash
-export PRIVATE_DIR=./.private/workbuddy-profile
-
-docker run --rm \
-  -v "$PRIVATE_DIR:/input:ro" \
-  -v buddy-api-mock_api-mock-data:/data \
-  alpine:3.20 \
-  sh -c '
-    test -s /input/model_instructions.private.md &&
-    test -s /input/workbuddy_profile.private.json &&
-    cp /input/model_instructions.private.md /data/model_instructions.private.md &&
-    cp /input/workbuddy_profile.private.json /data/workbuddy_profile.private.json &&
-    chown 65532:65532 /data/model_instructions.private.md /data/workbuddy_profile.private.json &&
-    chmod 600 /data/model_instructions.private.md /data/workbuddy_profile.private.json
-  '
+mkdir -p .private/workbuddy-profile
+# 将 model_instructions.private.md 和 workbuddy_profile.private.json 放到此目录
 ```
 
-在 `deploy/.env` 设置：
+在 `deploy/.env` 设置宿主机目录和容器内读取路径：
 
 ```dotenv
-API_MOCK_MODEL_INSTRUCTIONS_FILE=/data/model_instructions.private.md
-API_MOCK_WORKBUDDY_PROFILE_FILE=/data/workbuddy_profile.private.json
+API_MOCK_PRIVATE_PROFILE_DIR=./.private/workbuddy-profile
+API_MOCK_MODEL_INSTRUCTIONS_FILE=/private-profile/model_instructions.private.md
+API_MOCK_WORKBUDDY_PROFILE_FILE=/private-profile/workbuddy_profile.private.json
 ```
 
 然后重建容器以加载新的 Compose 环境变量：
@@ -134,13 +123,16 @@ docker compose -f docker-compose.yml up -d
 ```
 
 普通 Agent 请求的 `tools` 和 `tool_choice` 会原样转发；服务不再注入 WorkBuddy 工具。
-仅验证文件存在且运行账户可读时，可执行：
+
+挂载为只读，文件不会复制到镜像或 `api-mock-data` 卷。Linux/WSL 宿主机应让服务账户
+`65532` 可读取这两个私有文件；Windows Docker Desktop 的 bind mount 通常不需要额外调整。
+仅验证容器内文件存在且运行账户可读时，可执行：
 
 ```bash
 docker run --rm --user 65532:65532 \
-  -v buddy-api-mock_api-mock-data:/data \
+  -v "$(pwd)/.private/workbuddy-profile:/private-profile:ro" \
   alpine:3.20 \
-  sh -c 'test -r /data/model_instructions.private.md && test -r /data/workbuddy_profile.private.json'
+  sh -c 'test -r /private-profile/model_instructions.private.md && test -r /private-profile/workbuddy_profile.private.json'
 ```
 
 ### 4. 常用运维
@@ -203,9 +195,8 @@ curl http://127.0.0.1:13100/v1/chat/completions \
 - 正式 `conversation` 请求作为中转功能的一部分会实时发送到用户配置的上游；
   响应 SSE 按字节实时透传。服务只持久化请求元数据，不保存提示词、明文密钥或
   上游响应正文。
-- 普通 agent 调用需要在部署机数据卷内提供经过私有验证的系统提示词文件，并将
-  `API_MOCK_MODEL_INSTRUCTIONS_FILE` 指向该文件；公开镜像不包含该内容。
-- 普通 agent 调用还可配置 `API_MOCK_WORKBUDDY_PROFILE_FILE` 使用经私有验证的
-  WorkBuddy 请求头画像。仅允许 WorkBuddy 相关白名单头，账户池上游认证始终由服务端设置。
+- 普通 agent 调用可使用部署机的只读私有目录提供系统提示词和 WorkBuddy 请求头画像；
+  `API_MOCK_PRIVATE_PROFILE_DIR` 指定宿主机目录，另外两个变量指定容器内读取路径。
+  公开镜像不包含这些内容。仅允许 WorkBuddy 相关白名单头，账户池上游认证始终由服务端设置。
 - 只有用户在 `.env` 明确设置 `API_MOCK_WORKBUDDY_USER_ID` 时，该标识才会加入
   上游请求头；留空时不会生成或转发用户标识。

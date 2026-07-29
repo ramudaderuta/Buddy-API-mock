@@ -31,8 +31,9 @@ curl http://127.0.0.1:13100/v1/chat/completions \
 - `API_MOCK_ADMIN_PASSWORD`：仅用于 Web 控制台管理员登录。
 - `API_MOCK_API_KEY`：客户端调用 `/v1/chat/completions` 时必须提供的中转 Key。
 - `API_MOCK_WORKBUDDY_USER_ID`：可选；仅在显式设置时转发给上游。请只保留在本机 `.env`。
-- `API_MOCK_MODEL_INSTRUCTIONS_FILE`：可选；容器内私有系统提示词文件。为普通 agent 请求提供经验证的 WorkBuddy 系统画像；文件应仅存在于部署机的数据卷，不提交或复制进镜像。
-- `API_MOCK_WORKBUDDY_PROFILE_FILE`：可选；容器内私有 WorkBuddy 请求头画像。普通 agent 仅使用其白名单头；文件应仅存在于部署机的数据卷，不提交或复制进镜像。
+- `API_MOCK_PRIVATE_PROFILE_DIR`：可选；宿主机私有画像目录，以只读方式挂载到容器 `/private-profile`。默认 `./.private/workbuddy-profile`。
+- `API_MOCK_MODEL_INSTRUCTIONS_FILE`：可选；容器内私有系统提示词路径，例如 `/private-profile/model_instructions.private.md`。
+- `API_MOCK_WORKBUDDY_PROFILE_FILE`：可选；容器内私有 WorkBuddy 请求头画像路径，例如 `/private-profile/workbuddy_profile.private.json`。
 - 上游 Endpoint 和 API Key 在控制台「账户池」配置；上游 Key 不写入 `.env`。
 - 命名卷 `api-mock-data` 保存加密账户数据；普通 `docker compose down` 不会删除它。
 - WorkBuddy 的 `conversation_topic` 请求由本地返回固定 SSE 标题；正式对话仍转发至已配置上游。
