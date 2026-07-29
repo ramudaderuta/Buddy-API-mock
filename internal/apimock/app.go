@@ -105,6 +105,27 @@ func env(key, fallback string) string {
 
 var localPathPattern = regexp.MustCompile(`(?i)(?:[a-z]:[\\/]|\\\\(?:[^\\/]+)\\|/(?:home|users|private|var|tmp)(?:/|$))`)
 
+var modelInstructionTemplateVariables = map[string]string{
+	"ArtifactDirectoryPath":        "API_MOCK_PROMPT_ARTIFACT_DIRECTORY_PATH",
+	"BinaryContext":                "API_MOCK_PROMPT_BINARY_CONTEXT",
+	"ClawMemory_1":                 "API_MOCK_PROMPT_CLAW_MEMORY_1",
+	"ClawMemory_2":                 "API_MOCK_PROMPT_CLAW_MEMORY_2",
+	"ClawMemory_3":                 "API_MOCK_PROMPT_CLAW_MEMORY_3",
+	"dataFolderName":               "API_MOCK_PROMPT_DATA_FOLDER_NAME",
+	"ExpertManagement":             "API_MOCK_PROMPT_EXPERT_MANAGEMENT",
+	"modelName":                    "API_MOCK_PROMPT_MODEL_NAME",
+	"PluginAgentPrompt":            "API_MOCK_PROMPT_PLUGIN_AGENT_PROMPT",
+	"productName":                  "API_MOCK_PROMPT_PRODUCT_NAME",
+	"ResponseLanguage":             "API_MOCK_PROMPT_RESPONSE_LANGUAGE",
+	"subAgentPrompt":               "API_MOCK_PROMPT_SUB_AGENT_PROMPT",
+	"ToolResultPresentationPrompt": "API_MOCK_PROMPT_TOOL_RESULT_PRESENTATION_PROMPT",
+	"UserLocalMemoryContent":       "API_MOCK_PROMPT_USER_LOCAL_MEMORY_CONTENT",
+	"UserMemoryContent":            "API_MOCK_PROMPT_USER_MEMORY_CONTENT",
+	"WorkingMemoryContent":         "API_MOCK_PROMPT_WORKING_MEMORY_CONTENT",
+}
+
+var modelInstructionTemplatePlaceholder = regexp.MustCompile(`\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}`)
+
 func loadModelInstructions() (string, error) {
 	text := prompts.ModelInstructions
 	privateFile := false
@@ -114,6 +135,10 @@ func loadModelInstructions() (string, error) {
 			return "", errors.New("API_MOCK_MODEL_INSTRUCTIONS_FILE could not be read")
 		}
 		text = string(body)
+		text, err = renderModelInstructionTemplate(text)
+		if err != nil {
+			return "", err
+		}
 		privateFile = true
 	}
 	text = strings.TrimSpace(text)
@@ -126,6 +151,23 @@ func loadModelInstructions() (string, error) {
 		}
 	}
 	return text, nil
+}
+
+func renderModelInstructionTemplate(text string) (string, error) {
+	var unknown string
+	result := modelInstructionTemplatePlaceholder.ReplaceAllStringFunc(text, func(raw string) string {
+		name := modelInstructionTemplatePlaceholder.FindStringSubmatch(raw)[1]
+		key, ok := modelInstructionTemplateVariables[name]
+		if !ok {
+			unknown = name
+			return raw
+		}
+		return os.Getenv(key)
+	})
+	if unknown != "" {
+		return "", fmt.Errorf("system instructions contain unsupported template variable %q", unknown)
+	}
+	return result, nil
 }
 
 func loadWorkBuddyProfile() (map[string]string, error) {

@@ -59,6 +59,7 @@ cp .env.example .env
 | `API_MOCK_PRIVATE_PROFILE_DIR` | 可选。宿主机私有画像目录；以只读方式挂载到容器 `/private-profile`。默认是 `deploy/.private/workbuddy-profile`。 |
 | `API_MOCK_MODEL_INSTRUCTIONS_FILE` | 可选。容器内私有系统提示词路径。普通 agent 请求使用它构造 WorkBuddy 画像。 |
 | `API_MOCK_WORKBUDDY_PROFILE_FILE` | 可选。容器内私有 WorkBuddy 请求头画像路径。普通 agent 请求使用其中白名单头。 |
+| `API_MOCK_PROMPT_*` | 可选。私有 WorkBuddy 模板的动态块；仅在系统提示词文件包含对应 `{{placeholder}}` 时使用。具体变量见 `deploy/.env.example`。 |
 | `API_MOCK_IMAGE` | 可选。默认 `docker.io/ramudaderuta/buddy-api-mock:latest`。 |
 
 ### 2. 启动
@@ -121,6 +122,32 @@ API_MOCK_WORKBUDDY_PROFILE_FILE=/private-profile/workbuddy_profile.private.json
 cd deploy
 docker compose -f docker-compose.yml up -d
 ```
+
+#### 使用未展开的 WorkBuddy 模板
+
+不要把已验证可用的 WorkBuddy 模板替换成通用短提示词：上游可能将完整模板作为客户端
+画像的一部分。模板不随本仓库或镜像分发；请在**自己的** WorkBuddy 安装资源中搜索
+`workbuddy-prompt.tpl`，将原文件复制到私有目录
+`.private/workbuddy-profile/workbuddy-prompt.tpl`。然后在忽略的 `deploy/.env` 设置：
+
+```dotenv
+API_MOCK_MODEL_INSTRUCTIONS_FILE=/private-profile/workbuddy-prompt.tpl
+API_MOCK_PROMPT_MODEL_NAME=your-model-id
+API_MOCK_PROMPT_PRODUCT_NAME=WorkBuddy
+API_MOCK_PROMPT_RESPONSE_LANGUAGE=your-language
+```
+
+服务只渲染下列固定占位符，值从忽略的 `deploy/.env` 读取：
+
+`ArtifactDirectoryPath`、`BinaryContext`、`ClawMemory_1`、`ClawMemory_2`、
+`ClawMemory_3`、`dataFolderName`、`ExpertManagement`、`modelName`、
+`PluginAgentPrompt`、`productName`、`ResponseLanguage`、`subAgentPrompt`、
+`ToolResultPresentationPrompt`、`UserLocalMemoryContent`、`UserMemoryContent`、
+`WorkingMemoryContent`。
+
+它们分别对应 `API_MOCK_PROMPT_<UPPER_SNAKE_CASE>`，完整列表和安全占位写法见
+`deploy/.env.example`。未配置的已知变量渲染为空；遇到未知变量时容器启动失败，避免将
+未渲染的模板发送到上游。模板与变量值都必须保留在私有目录或忽略的 `.env`，不能提交。
 
 普通 Agent 请求的 `tools` 和 `tool_choice` 会原样转发；服务不再注入 WorkBuddy 工具。
 

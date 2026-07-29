@@ -39,6 +39,36 @@ func TestLoadModelInstructionsUsesPrivateRuntimeFile(t *testing.T) {
 	}
 }
 
+func TestLoadModelInstructionsRendersPrivateTemplateVariables(t *testing.T) {
+	path := t.TempDir() + "/model_instructions.private.md"
+	template := strings.Repeat("{{productName}} uses {{modelName}}. ", 4) + "{{UserMemoryContent}}"
+	if err := os.WriteFile(path, []byte(template), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("API_MOCK_MODEL_INSTRUCTIONS_FILE", path)
+	t.Setenv("API_MOCK_PROMPT_PRODUCT_NAME", "WorkBuddy")
+	t.Setenv("API_MOCK_PROMPT_MODEL_NAME", "example-model")
+	t.Setenv("API_MOCK_PROMPT_USER_MEMORY_CONTENT", "private memory")
+
+	got, err := loadModelInstructions()
+	if err != nil || strings.Contains(got, "{{") || !strings.Contains(got, "WorkBuddy uses example-model") || !strings.HasSuffix(got, "private memory") {
+		t.Fatalf("loadModelInstructions() did not render private template: %q, %v", got, err)
+	}
+}
+
+func TestLoadModelInstructionsRejectsUnknownPrivateTemplateVariable(t *testing.T) {
+	path := t.TempDir() + "/model_instructions.private.md"
+	template := strings.Repeat("private instructions {{UnknownVariable}} ", 4)
+	if err := os.WriteFile(path, []byte(template), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("API_MOCK_MODEL_INSTRUCTIONS_FILE", path)
+
+	if _, err := loadModelInstructions(); err == nil || !strings.Contains(err.Error(), "UnknownVariable") {
+		t.Fatalf("loadModelInstructions() error = %v, want unsupported variable", err)
+	}
+}
+
 func TestLoadWorkBuddyProfileUsesPrivateRuntimeFile(t *testing.T) {
 	path := t.TempDir() + "/workbuddy_profile.private.json"
 	if err := os.WriteFile(path, []byte(`{"headers":{"User-Agent":"WorkBuddy/test","X-Agent-Purpose":"conversation"}}`), 0o600); err != nil {
