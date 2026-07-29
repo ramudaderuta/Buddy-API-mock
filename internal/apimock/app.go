@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ramudaderuta/Buddy-API-mock/prompts"
 )
@@ -48,16 +47,17 @@ type state struct {
 	Records  []Record  `json:"records"`
 }
 type app struct {
-	mu               sync.Mutex
-	dataPath         string
-	key              []byte
-	password         string
-	apiKey           string
-	state            state
-	sessions         map[string]string
-	client           *http.Client
-	skillDescription string
-	workBuddyUserID  string
+	mu                sync.Mutex
+	dataPath          string
+	key               []byte
+	password          string
+	apiKey            string
+	state             state
+	sessions          map[string]string
+	client            *http.Client
+	modelInstructions string
+	workBuddyProfile  map[string]string
+	workBuddyUserID   string
 }
 
 func Run() error {
@@ -72,11 +72,12 @@ func Run() error {
 	}
 	dataDir := env("API_MOCK_DATA_DIR", "./data")
 	workBuddyUserID := strings.TrimSpace(os.Getenv("API_MOCK_WORKBUDDY_USER_ID"))
-	skillDescription, err := loadSkillDescription()
+	modelInstructions, err := loadModelInstructions()
 	if err != nil {
 		return err
 	}
-	if err := validateInjectedText("system instructions", prompts.ModelInstructions); err != nil {
+	workBuddyProfile, err := loadWorkBuddyProfile()
+	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -86,7 +87,7 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: &http.Client{Timeout: 10 * time.Minute}, skillDescription: skillDescription, workBuddyUserID: workBuddyUserID}
+	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: &http.Client{Timeout: 10 * time.Minute}, modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID}
 	if err := a.load(); err != nil {
 		return err
 	}
@@ -102,44 +103,47 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// loadSkillDescription prefers an optional host override file, otherwise the
-// description embedded from prompts/skill_description.txt.
-func loadSkillDescription() (string, error) {
-	var text string
-	if path := strings.TrimSpace(os.Getenv("API_MOCK_SKILL_DESCRIPTION_FILE")); path != "" {
-		b, err := os.ReadFile(path)
+var localPathPattern = regexp.MustCompile(`(?i)(?:[a-z]:[\\/]|\\\\(?:[^\\/]+)\\|/(?:home|users|private|var|tmp)(?:/|$))`)
+
+func loadModelInstructions() (string, error) {
+	text := prompts.ModelInstructions
+	privateFile := false
+	if path := strings.TrimSpace(os.Getenv("API_MOCK_MODEL_INSTRUCTIONS_FILE")); path != "" {
+		body, err := os.ReadFile(path)
 		if err != nil {
-			return "", errors.New("API_MOCK_SKILL_DESCRIPTION_FILE could not be read")
+			return "", errors.New("API_MOCK_MODEL_INSTRUCTIONS_FILE could not be read")
 		}
-		text = string(b)
-	} else {
-		text = prompts.SkillDescription
+		text = string(body)
+		privateFile = true
 	}
-	text = sanitizeSkillDescription(text)
+	text = strings.TrimSpace(text)
 	if len(text) < 100 {
-		return "", errors.New("Skill description is missing or too short")
+		return "", errors.New("system instructions are missing or too short")
 	}
-	if err := validateInjectedText("Skill description", text); err != nil {
-		return "", err
+	if !privateFile {
+		if err := validateInjectedText("system instructions", text); err != nil {
+			return "", err
+		}
 	}
 	return text, nil
 }
 
-var skillLocationPattern = regexp.MustCompile(`(?im)\s*\(location:\s*[^\r\n)]*\)`)
-var localPathPattern = regexp.MustCompile(`(?i)(?:[a-z]:[\\/]|\\\\(?:[^\\/]+)\\|/(?:home|users|private|var|tmp)(?:/|$))`)
-
-func sanitizeSkillDescription(text string) string {
-	return strings.TrimSpace(skillLocationPattern.ReplaceAllStringFunc(text, redactSkillLocation))
-}
-
-func redactSkillLocation(location string) string {
-	const prefix = " (location: "
-	const suffix = ")"
-	padding := utf8.RuneCountInString(location) - utf8.RuneCountInString(prefix) - utf8.RuneCountInString(suffix)
-	if padding < 1 {
-		return prefix + "redacted" + suffix
+func loadWorkBuddyProfile() (map[string]string, error) {
+	path := strings.TrimSpace(os.Getenv("API_MOCK_WORKBUDDY_PROFILE_FILE"))
+	if path == "" {
+		return nil, nil
 	}
-	return prefix + strings.Repeat("x", padding) + suffix
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("API_MOCK_WORKBUDDY_PROFILE_FILE could not be read")
+	}
+	var profile struct {
+		Headers map[string]string `json:"headers"`
+	}
+	if err := json.Unmarshal(body, &profile); err != nil || len(profile.Headers) == 0 {
+		return nil, errors.New("API_MOCK_WORKBUDDY_PROFILE_FILE is invalid")
+	}
+	return profile.Headers, nil
 }
 
 func validateInjectedText(name, text string) error {
@@ -487,7 +491,6 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 503, e.Error())
 		return
 	}
-	request["model"] = account.Model
 	if _, ok := request["messages"].([]any); !ok {
 		appErr(w, 400, "messages is required")
 		return
@@ -498,7 +501,13 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		a.record(account, request, http.StatusOK, true, started)
 		return
 	}
-	applyWorkBuddyRequestProfile(request, a.skillDescription)
+	request["model"] = account.Model
+	nativeWorkBuddy := isNativeWorkBuddyConversation(r, request)
+	if nativeWorkBuddy {
+		applyNativeWorkBuddyProfile(request)
+	} else {
+		applyWorkBuddyRequestProfile(request, a.modelInstructions)
+	}
 	body, _ = json.Marshal(request)
 	key, e := a.decrypt(account.Key)
 	if e != nil {
@@ -510,7 +519,13 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 502, "invalid upstream request")
 		return
 	}
-	for k, v := range workBuddyHeaders(key, a.workBuddyUserID) {
+	headers := workBuddyHeaders(key, a.workBuddyUserID)
+	if nativeWorkBuddy {
+		overlayNativeWorkBuddyHeaders(headers, r.Header)
+	} else {
+		overlayWorkBuddyProfile(headers, a.workBuddyProfile)
+	}
+	for k, v := range headers {
 		upstream.Header.Set(k, v)
 	}
 	upstream.Header.Set("Content-Type", "application/json")
@@ -541,6 +556,55 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 
 func isWorkBuddyConversationTopic(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Agent-Purpose")), "conversation_topic")
+}
+
+func isNativeWorkBuddyConversation(r *http.Request, request map[string]any) bool {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Agent-Purpose")), "conversation") || strings.TrimSpace(r.Header.Get("X-CodeBuddy-Request")) != "1" {
+		return false
+	}
+	tools, ok := request["tools"].([]any)
+	return ok && len(tools) >= 20
+}
+
+var workBuddyHeaderNames = []string{
+	"Accept", "User-Agent", "X-Agent-Intent", "X-Agent-Purpose", "X-CodeBuddy-Request", "X-Domain", "X-IDE-Name", "X-IDE-Type", "X-IDE-Version", "X-Product", "X-Requested-With", "X-Stainless-Arch", "X-Stainless-Lang", "X-Stainless-OS", "X-Stainless-Package-Version", "X-Stainless-Retry-Count", "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "Acp-Connection-ID", "B3", "Traceparent", "X-B3-ParentSpanID", "X-B3-Sampled", "X-B3-SpanID", "X-B3-TraceID", "X-Trace-ID", "X-User-ID", "X-Conversation-ID", "X-Conversation-Message-ID", "X-Conversation-Request-ID", "X-Request-ID",
+}
+
+func overlayNativeWorkBuddyHeaders(target map[string]string, source http.Header) {
+	profile := make(map[string]string, len(workBuddyHeaderNames))
+	for _, name := range workBuddyHeaderNames {
+		profile[name] = source.Get(name)
+	}
+	overlayWorkBuddyProfile(target, profile)
+}
+
+func overlayWorkBuddyProfile(target, source map[string]string) {
+	for _, name := range workBuddyHeaderNames {
+		if value := strings.TrimSpace(workBuddyProfileHeader(source, name)); value != "" {
+			target[name] = value
+		}
+	}
+}
+
+func workBuddyProfileHeader(profile map[string]string, name string) string {
+	if value := profile[name]; value != "" {
+		return value
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if value := profile[canonical]; value != "" {
+		return value
+	}
+	for key, value := range profile {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
+}
+
+func applyNativeWorkBuddyProfile(request map[string]any) {
+	delete(request, "tools")
+	delete(request, "tool_choice")
 }
 
 func writeWorkBuddyConversationTopic(w http.ResponseWriter, model string) {
@@ -608,49 +672,42 @@ func (d *sseErrorDetector) inspectLine() {
 	}
 }
 
-func applyWorkBuddyRequestProfile(request map[string]any, skillDescription string) {
-	normalizeWorkBuddyMessages(request)
+func applyWorkBuddyRequestProfile(request map[string]any, modelInstructions string) {
+	prependModelInstructions(request, modelInstructions)
 	request["stream"] = true
 	request["reasoning_effort"] = "low"
 	request["temperature"] = 1
 	request["stream_options"] = map[string]any{"include_usage": true}
-	request["tools"] = []any{map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        "buddy_skill",
-			"description": skillDescription,
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"skill":   map[string]any{"type": "string", "description": "The skill name."},
-					"command": map[string]any{"type": "string", "description": "Legacy skill name without arguments."},
-					"args":    map[string]any{"type": "string", "description": "Optional arguments for the skill."},
-				},
-				"additionalProperties": false,
-				"$schema":              "http://json-schema.org/draft-07/schema#",
-			},
-			"strict": false,
-		},
-	}}
-	request["tool_choice"] = "none"
 }
 
-func normalizeWorkBuddyMessages(request map[string]any) {
+func prependModelInstructions(request map[string]any, instructions string) {
 	messages, ok := request["messages"].([]any)
-	if !ok {
+	if !ok || instructions == "" {
 		return
 	}
-	for _, raw := range messages {
-		message, ok := raw.(map[string]any)
-		if !ok || message["role"] != "user" {
-			continue
-		}
-		content, ok := message["content"].(string)
-		if !ok {
-			continue
-		}
-		message["content"] = []any{map[string]any{"type": "text", "text": content}}
+	if len(messages) > 0 && isModelInstructions(messages[0], instructions) {
+		return
 	}
+	request["messages"] = append([]any{map[string]any{
+		"role":    "system",
+		"content": instructions,
+	}}, messages...)
+}
+
+func isModelInstructions(raw any, instructions string) bool {
+	message, ok := raw.(map[string]any)
+	if !ok || message["role"] != "system" {
+		return false
+	}
+	if content, ok := message["content"].(string); ok {
+		return content == instructions
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		return false
+	}
+	part, ok := content[0].(map[string]any)
+	return ok && part["type"] == "text" && part["text"] == instructions
 }
 
 func workBuddyHeaders(key, userID string) map[string]string {

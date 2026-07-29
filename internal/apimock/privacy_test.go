@@ -1,27 +1,12 @@
 package apimock
 
 import (
-	"github.com/ramudaderuta/Buddy-API-mock/prompts"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
-
-func TestSanitizeSkillDescriptionRemovesLocationSuffixes(t *testing.T) {
-	input := "- skill: useful skill (location: C:\\Users\\alice\\AppData\\Local\\skill.md)\n- other: stays"
-	got := sanitizeSkillDescription(input)
-	if strings.Contains(got, "C:\\Users\\alice") {
-		t.Fatalf("sanitizeSkillDescription() retained local path: %q", got)
-	}
-	if utf8.RuneCountInString(got) != utf8.RuneCountInString(input) {
-		t.Fatalf("sanitizeSkillDescription() changed length: got %d, want %d", utf8.RuneCountInString(got), utf8.RuneCountInString(input))
-	}
-	if !strings.Contains(got, "(location: ") {
-		t.Fatalf("sanitizeSkillDescription() removed location metadata: %q", got)
-	}
-}
 
 func TestValidateInjectedTextRejectsLocalPaths(t *testing.T) {
 	for _, value := range []string{
@@ -41,13 +26,28 @@ func TestValidateInjectedTextAllowsNeutralDescription(t *testing.T) {
 	}
 }
 
-func TestEmbeddedSkillDescriptionMeetsWorkBuddyCompatibilityFloor(t *testing.T) {
-	description := sanitizeSkillDescription(prompts.SkillDescription)
-	if got := utf8.RuneCountInString(description); got < 6144 {
-		t.Fatalf("embedded Skill description is too short for the WorkBuddy profile: %d runes", got)
+func TestLoadModelInstructionsUsesPrivateRuntimeFile(t *testing.T) {
+	path := t.TempDir() + "/model_instructions.private.md"
+	private := strings.Repeat("private runtime instructions that remain inside the deployment data volume. ", 2)
+	if err := os.WriteFile(path, []byte(private), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if err := validateInjectedText("Skill description", description); err != nil {
-		t.Fatalf("embedded Skill description is unsafe: %v", err)
+	t.Setenv("API_MOCK_MODEL_INSTRUCTIONS_FILE", path)
+	got, err := loadModelInstructions()
+	if err != nil || got != strings.TrimSpace(private) {
+		t.Fatalf("loadModelInstructions() = %q, %v", got, err)
+	}
+}
+
+func TestLoadWorkBuddyProfileUsesPrivateRuntimeFile(t *testing.T) {
+	path := t.TempDir() + "/workbuddy_profile.private.json"
+	if err := os.WriteFile(path, []byte(`{"headers":{"User-Agent":"WorkBuddy/test","X-Agent-Purpose":"conversation"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("API_MOCK_WORKBUDDY_PROFILE_FILE", path)
+	profile, err := loadWorkBuddyProfile()
+	if err != nil || profile["User-Agent"] != "WorkBuddy/test" {
+		t.Fatalf("loadWorkBuddyProfile() = %#v, %v", profile, err)
 	}
 }
 
@@ -58,7 +58,7 @@ func TestApplyWorkBuddyRequestProfile(t *testing.T) {
 		"stream":   false,
 	}
 
-	applyWorkBuddyRequestProfile(request, "skill catalog")
+	applyWorkBuddyRequestProfile(request, "system contract")
 
 	if request["stream"] != true || request["reasoning_effort"] != "low" || request["temperature"] != 1 {
 		t.Fatalf("unexpected WorkBuddy request profile: %#v", request)
@@ -67,25 +67,53 @@ func TestApplyWorkBuddyRequestProfile(t *testing.T) {
 	if !ok || streamOptions["include_usage"] != true {
 		t.Fatalf("missing stream usage option: %#v", request["stream_options"])
 	}
-	tools, ok := request["tools"].([]any)
-	if !ok || len(tools) != 1 {
-		t.Fatalf("unexpected tools: %#v", request["tools"])
+	if _, ok := request["tools"]; ok {
+		t.Fatalf("unexpected injected tools: %#v", request["tools"])
 	}
-	function := tools[0].(map[string]any)["function"].(map[string]any)
-	if function["name"] != "buddy_skill" || function["description"] != "skill catalog" {
-		t.Fatalf("unexpected skill function: %#v", function)
-	}
-	parameters := function["parameters"].(map[string]any)
-	if parameters["$schema"] != "http://json-schema.org/draft-07/schema#" || parameters["additionalProperties"] != false {
-		t.Fatalf("unexpected skill schema: %#v", parameters)
-	}
-	if request["tool_choice"] != "none" {
-		t.Fatalf("unexpected tool choice: %#v", request["tool_choice"])
+	if _, ok := request["tool_choice"]; ok {
+		t.Fatalf("unexpected injected tool choice: %#v", request["tool_choice"])
 	}
 	messages := request["messages"].([]any)
-	content, ok := messages[0].(map[string]any)["content"].([]any)
-	if !ok || len(content) != 1 || content[0].(map[string]any)["type"] != "text" || content[0].(map[string]any)["text"] != "hello" {
+	if len(messages) != 2 {
+		t.Fatalf("unexpected messages: %#v", messages)
+	}
+	system := messages[0].(map[string]any)
+	if system["role"] != "system" || system["content"] != "system contract" {
+		t.Fatalf("unexpected system instructions: %#v", system)
+	}
+	if messages[1].(map[string]any)["content"] != "hello" {
 		t.Fatalf("unexpected WorkBuddy user content: %#v", messages[0])
+	}
+}
+
+func TestApplyWorkBuddyRequestProfileDoesNotDuplicateModelInstructions(t *testing.T) {
+	request := map[string]any{
+		"messages": []any{map[string]any{
+			"role":    "system",
+			"content": []any{map[string]any{"type": "text", "text": "system contract"}},
+		}},
+	}
+
+	applyWorkBuddyRequestProfile(request, "system contract")
+
+	messages := request["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("model instructions duplicated: %#v", messages)
+	}
+}
+
+func TestApplyWorkBuddyRequestProfilePreservesCallerTools(t *testing.T) {
+	customTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "custom_tool"}}}
+	request := map[string]any{
+		"messages":    []any{map[string]any{"role": "user", "content": "hello"}},
+		"tools":       customTools,
+		"tool_choice": "auto",
+	}
+
+	applyWorkBuddyRequestProfile(request, "system contract")
+
+	if request["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"] != "custom_tool" || request["tool_choice"] != "auto" {
+		t.Fatalf("caller tool settings were changed: %#v", request)
 	}
 }
 
@@ -101,6 +129,89 @@ func TestWorkBuddyHeadersIncludeConfiguredUserContext(t *testing.T) {
 	}
 	if headers["X-User-ID"] != "00000000-0000-0000-0000-000000000000" {
 		t.Fatalf("unexpected user ID: %q", headers["X-User-ID"])
+	}
+}
+
+func TestNativeWorkBuddyConversationPreservesClientProfile(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("X-Agent-Purpose", "conversation")
+	request.Header.Set("X-CodeBuddy-Request", "1")
+	payload := map[string]any{"tools": make([]any, 20)}
+	if !isNativeWorkBuddyConversation(request, payload) {
+		t.Fatal("expected a complete native WorkBuddy request to be preserved")
+	}
+}
+
+func TestNativeWorkBuddyConversationDetectsClientProfile(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("X-Agent-Purpose", "conversation")
+	request.Header.Set("X-CodeBuddy-Request", "1")
+	payload := map[string]any{"model": "client-model", "tools": make([]any, 20)}
+	if !isNativeWorkBuddyConversation(request, payload) {
+		t.Fatalf("native WorkBuddy profile was not detected: %#v", payload)
+	}
+}
+
+func TestNativeWorkBuddyProfileRemovesWorkBuddyToolSettings(t *testing.T) {
+	payload := map[string]any{"tools": []any{map[string]any{"type": "function"}}, "tool_choice": "none"}
+	applyNativeWorkBuddyProfile(payload)
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("native tool choice must be removed: %#v", payload)
+	}
+	if _, ok := payload["tools"]; ok {
+		t.Fatalf("native tools must be removed: %#v", payload)
+	}
+}
+
+func TestIncompleteWorkBuddyConversationUsesRelayProfile(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("X-Agent-Purpose", "conversation")
+	request.Header.Set("X-CodeBuddy-Request", "1")
+	payload := map[string]any{"tools": make([]any, 1)}
+	if isNativeWorkBuddyConversation(request, payload) {
+		t.Fatal("incomplete client profile must use the relay profile")
+	}
+}
+
+func TestNativeWorkBuddyHeadersOverrideGeneratedProfile(t *testing.T) {
+	headers := workBuddyHeaders("upstream-key", "configured-user")
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("User-Agent", "WorkBuddy/current")
+	request.Header.Set("X-User-ID", "native-user")
+	request.Header.Set("X-Trace-ID", "native-trace")
+	overlayNativeWorkBuddyHeaders(headers, request.Header)
+	if headers["User-Agent"] != "WorkBuddy/current" || headers["X-User-ID"] != "native-user" || headers["X-Trace-ID"] != "native-trace" {
+		t.Fatalf("native WorkBuddy headers were not preserved: %#v", headers)
+	}
+	if headers["Authorization"] != "Bearer upstream-key" || headers["X-API-Key"] != "upstream-key" {
+		t.Fatalf("upstream authentication was changed: %#v", headers)
+	}
+}
+
+func TestPrivateWorkBuddyProfileOnlyOverlaysAllowedHeaders(t *testing.T) {
+	headers := workBuddyHeaders("upstream-key", "configured-user")
+	overlayWorkBuddyProfile(headers, map[string]string{
+		"User-Agent":    "WorkBuddy/private",
+		"X-Trace-ID":    "private-trace",
+		"Authorization": "Bearer attacker-key",
+		"X-API-Key":     "attacker-key",
+	})
+	if headers["User-Agent"] != "WorkBuddy/private" || headers["X-Trace-ID"] != "private-trace" {
+		t.Fatalf("allowed private profile headers were not applied: %#v", headers)
+	}
+	if headers["Authorization"] != "Bearer upstream-key" || headers["X-API-Key"] != "upstream-key" {
+		t.Fatalf("upstream authentication was changed: %#v", headers)
+	}
+}
+
+func TestPrivateWorkBuddyProfileMatchesCanonicalHeaderCasing(t *testing.T) {
+	headers := workBuddyHeaders("upstream-key", "configured-user")
+	overlayWorkBuddyProfile(headers, map[string]string{
+		"X-Codebuddy-Request": "private-request",
+		"X-Stainless-Os":      "private-os",
+	})
+	if headers["X-CodeBuddy-Request"] != "private-request" || headers["X-Stainless-OS"] != "private-os" {
+		t.Fatalf("canonical private profile headers were not applied: %#v", headers)
 	}
 }
 
