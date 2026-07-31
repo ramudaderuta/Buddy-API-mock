@@ -168,6 +168,12 @@ X-API-Mock-Account-ID: <enabled-account-id>
 WorkBuddy 系统提示词，并保留客户端的 `tools`、`tool_choice`、assistant
 `tool_calls` 和 `tool` 结果。因此 function 名称及参数 schema 应由客户端自己定义。
 
+不带 `X-API-Mock-Account-ID` 时，relay 根据当前账户池调度策略自动选择可用账户；带上时
+只使用该内部 ID 对应的已启用账户。账户不存在或已禁用会返回
+`503 requested account is unavailable`。该 ID 仅用于 relay 本地选账户，不会转发到上游，
+也不等于 WorkBuddy 用户 ID、上游账号或 API Key。不同部署的数据卷具有独立账户池，不能
+复用另一台部署中的账户 ID。
+
 Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。示例中的 ID
 和 Key 均为占位符：
 
