@@ -200,6 +200,7 @@ func TestNativeWorkBuddyProfilePreservesWorkBuddyToolSettings(t *testing.T) {
 func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 	payload := map[string]any{
 		"max_completion_tokens": 128,
+		"reasoning_effort":       "medium",
 		"store":                 false,
 		"tools":                 []any{map[string]any{"type": "function"}},
 		"tool_choice":           "auto",
@@ -218,7 +219,7 @@ func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 	if got := len(payload["tools"].([]any)); got != 1 || payload["tool_choice"] != "auto" {
 		t.Fatalf("Pi tools must be preserved: %#v", payload)
 	}
-	if payload["reasoning_effort"] != "low" || payload["temperature"] != 1 || payload["stream"] != true {
+	if payload["reasoning_effort"] != "medium" || payload["temperature"] != 1 || payload["stream"] != true {
 		t.Fatalf("WorkBuddy request profile was not applied: %#v", payload)
 	}
 	messages := payload["messages"].([]any)

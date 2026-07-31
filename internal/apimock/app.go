@@ -794,7 +794,9 @@ func (d *sseErrorDetector) inspectLine() {
 func applyWorkBuddyRequestProfile(request map[string]any, modelInstructions string) {
 	prependModelInstructions(request, modelInstructions)
 	request["stream"] = true
-	request["reasoning_effort"] = "low"
+	if _, ok := request["reasoning_effort"]; !ok {
+		request["reasoning_effort"] = "low"
+	}
 	request["temperature"] = 1
 	request["stream_options"] = map[string]any{"include_usage": true}
 }
