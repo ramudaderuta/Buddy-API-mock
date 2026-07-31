@@ -149,7 +149,8 @@ API_MOCK_PROMPT_RESPONSE_LANGUAGE=your-language
 `deploy/.env.example`。未配置的已知变量渲染为空；遇到未知变量时容器启动失败，避免将
 未渲染的模板发送到上游。模板与变量值都必须保留在私有目录或忽略的 `.env`，不能提交。
 
-普通 Agent 请求的 `tools` 和 `tool_choice` 会原样转发；服务不再注入 WorkBuddy 工具。
+普通 Agent 已声明的 `tools` 和 `tool_choice` 会原样转发；只有调用方未声明 `tools` 且私有
+`API_MOCK_WORKBUDDY_TOOL_TEMPLATE_FILE` 已配置时，服务才以该模板作为 WorkBuddy 工具目录回退。
 
 #### Pi 与其他 Agent 的工具兼容模式
 
