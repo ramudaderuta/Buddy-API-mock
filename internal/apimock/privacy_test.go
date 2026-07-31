@@ -186,14 +186,88 @@ func TestNativeWorkBuddyConversationDetectsClientProfile(t *testing.T) {
 	}
 }
 
-func TestNativeWorkBuddyProfileRemovesWorkBuddyToolSettings(t *testing.T) {
+func TestNativeWorkBuddyProfilePreservesWorkBuddyToolSettings(t *testing.T) {
 	payload := map[string]any{"tools": []any{map[string]any{"type": "function"}}, "tool_choice": "none"}
 	applyNativeWorkBuddyProfile(payload)
-	if _, ok := payload["tool_choice"]; ok {
-		t.Fatalf("native tool choice must be removed: %#v", payload)
+	if got := payload["tool_choice"]; got != "none" {
+		t.Fatalf("native tool choice must be preserved: %#v", payload)
 	}
-	if _, ok := payload["tools"]; ok {
-		t.Fatalf("native tools must be removed: %#v", payload)
+	if got := len(payload["tools"].([]any)); got != 1 {
+		t.Fatalf("native tools must be preserved: %#v", payload)
+	}
+}
+
+func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
+	payload := map[string]any{
+		"max_completion_tokens": 128,
+		"store":                 false,
+		"tools":                 []any{map[string]any{"type": "function"}},
+		"tool_choice":           "auto",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "Pi system"},
+			map[string]any{"role": "user", "content": "hello"},
+		},
+	}
+	applyAgentWorkBuddyProfile(payload, "WorkBuddy system", nil)
+	if _, ok := payload["max_completion_tokens"]; ok {
+		t.Fatalf("Pi output-token field must be removed: %#v", payload)
+	}
+	if _, ok := payload["store"]; ok {
+		t.Fatalf("Pi store field must be removed: %#v", payload)
+	}
+	if got := len(payload["tools"].([]any)); got != 1 || payload["tool_choice"] != "auto" {
+		t.Fatalf("Pi tools must be preserved: %#v", payload)
+	}
+	if payload["reasoning_effort"] != "low" || payload["temperature"] != 1 || payload["stream"] != true {
+		t.Fatalf("WorkBuddy request profile was not applied: %#v", payload)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 2 || messages[0].(map[string]any)["content"] != "WorkBuddy system" || messages[1].(map[string]any)["role"] != "user" {
+		t.Fatalf("Pi system prompt must be replaced: %#v", payload)
+	}
+}
+
+func TestPiWorkBuddyProfilePreservesTypedUserContent(t *testing.T) {
+	typedContent := []any{map[string]any{"type": "text", "text": "hello"}}
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": "Pi system"},
+			map[string]any{"role": "user", "content": typedContent},
+		},
+	}
+
+	applyAgentWorkBuddyProfile(payload, "WorkBuddy system", nil)
+
+	messages := payload["messages"].([]any)
+	user := messages[1].(map[string]any)
+	if _, ok := user["content"].([]any); !ok {
+		t.Fatalf("typed user content must be retained: %#v", user)
+	}
+}
+
+func TestPiWorkBuddyProfileKeepsPiToolsWhenNativeFallbackExists(t *testing.T) {
+	piTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "bash"}}}
+	nativeTools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}}}
+	payload := map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		"tools":    piTools,
+	}
+
+	applyAgentWorkBuddyProfile(payload, "WorkBuddy system", nativeTools)
+
+	name := payload["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"]
+	if name != "bash" {
+		t.Fatalf("Pi tools must not be replaced by native fallback: %#v", payload["tools"])
+	}
+}
+
+func TestWorkBuddyCompatibleAgentAcceptsGenericAndLegacyHeaders(t *testing.T) {
+	for _, header := range []string{"X-API-Mock-WorkBuddy-Compatible", "X-API-Mock-Pi-WorkBuddy"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		request.Header.Set(header, "1")
+		if !isWorkBuddyCompatibleAgent(request) {
+			t.Fatalf("%s must enable compatibility mode", header)
+		}
 	}
 }
 

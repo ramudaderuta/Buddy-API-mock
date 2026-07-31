@@ -47,17 +47,19 @@ type state struct {
 	Records  []Record  `json:"records"`
 }
 type app struct {
-	mu                sync.Mutex
-	dataPath          string
-	key               []byte
-	password          string
-	apiKey            string
-	state             state
-	sessions          map[string]string
-	client            *http.Client
-	modelInstructions string
-	workBuddyProfile  map[string]string
-	workBuddyUserID   string
+	mu                 sync.Mutex
+	dataPath           string
+	key                []byte
+	password           string
+	apiKey             string
+	state              state
+	sessions           map[string]string
+	client             *http.Client
+	modelInstructions  string
+	workBuddyProfile   map[string]string
+	workBuddyUserID    string
+	workBuddyTools     []any
+	outgoingCaptureDir string
 }
 
 func Run() error {
@@ -80,6 +82,10 @@ func Run() error {
 	if err != nil {
 		return err
 	}
+	workBuddyTools, err := loadWorkBuddyTools()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return err
 	}
@@ -87,7 +93,7 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: &http.Client{Timeout: 10 * time.Minute}, modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID}
+	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: &http.Client{Timeout: 10 * time.Minute}, modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID, workBuddyTools: workBuddyTools, outgoingCaptureDir: strings.TrimSpace(os.Getenv("API_MOCK_OUTGOING_CAPTURE_DIR"))}
 	if err := a.load(); err != nil {
 		return err
 	}
@@ -186,6 +192,26 @@ func loadWorkBuddyProfile() (map[string]string, error) {
 		return nil, errors.New("API_MOCK_WORKBUDDY_PROFILE_FILE is invalid")
 	}
 	return profile.Headers, nil
+}
+
+func loadWorkBuddyTools() ([]any, error) {
+	path := strings.TrimSpace(os.Getenv("API_MOCK_WORKBUDDY_TOOL_TEMPLATE_FILE"))
+	if path == "" {
+		return nil, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("API_MOCK_WORKBUDDY_TOOL_TEMPLATE_FILE could not be read")
+	}
+	var request map[string]any
+	if json.Unmarshal(body, &request) != nil {
+		return nil, errors.New("API_MOCK_WORKBUDDY_TOOL_TEMPLATE_FILE is invalid")
+	}
+	tools, ok := request["tools"].([]any)
+	if !ok || len(tools) < 20 {
+		return nil, errors.New("API_MOCK_WORKBUDDY_TOOL_TEMPLATE_FILE lacks a native tool catalog")
+	}
+	return tools, nil
 }
 
 func validateInjectedText(name, text string) error {
@@ -466,9 +492,17 @@ func normalizeEndpoint(raw string) (string, error) {
 	u.Path = strings.TrimSuffix(u.Path, "/chat/completions")
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
-func (a *app) choose() (Account, error) {
+func (a *app) choose(preferredID string) (Account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if preferredID != "" {
+		for _, account := range a.state.Accounts {
+			if account.ID == preferredID && account.Enabled {
+				return account, nil
+			}
+		}
+		return Account{}, errors.New("requested account is unavailable")
+	}
 	available := make([]int, 0)
 	for i, x := range a.state.Accounts {
 		if x.Enabled {
@@ -528,7 +562,7 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 400, "messages is required")
 		return
 	}
-	account, e := a.choose()
+	account, e := a.choose(strings.TrimSpace(r.Header.Get("X-API-Mock-Account-ID")))
 	if e != nil {
 		appErr(w, 503, e.Error())
 		return
@@ -545,7 +579,13 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	request["model"] = account.Model
 	nativeWorkBuddy := isNativeWorkBuddyConversation(r, request)
-	if nativeWorkBuddy {
+	openAICompatible := strings.EqualFold(strings.TrimSpace(r.Header.Get("X-API-Mock-OpenAI-Compatible")), "1")
+	workBuddyCompatible := isWorkBuddyCompatibleAgent(r)
+	if workBuddyCompatible {
+		applyAgentWorkBuddyProfile(request, a.modelInstructions, a.workBuddyTools)
+	} else if openAICompatible {
+		applyOpenAICompatibleProfile(request)
+	} else if nativeWorkBuddy {
 		applyNativeWorkBuddyProfile(request)
 	} else {
 		applyWorkBuddyRequestProfile(request, a.modelInstructions)
@@ -562,7 +602,9 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	headers := workBuddyHeaders(key, a.workBuddyUserID)
-	if nativeWorkBuddy {
+	if openAICompatible {
+		headers = map[string]string{"Authorization": "Bearer " + key, "User-Agent": "curl/8.5.0", "Accept": "*/*"}
+	} else if nativeWorkBuddy {
 		overlayNativeWorkBuddyHeaders(headers, r.Header)
 	} else {
 		overlayWorkBuddyProfile(headers, a.workBuddyProfile)
@@ -571,6 +613,9 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		upstream.Header.Set(k, v)
 	}
 	upstream.Header.Set("Content-Type", "application/json")
+	if workBuddyCompatible {
+		a.captureOutgoing(body, headers)
+	}
 	response, e := a.client.Do(upstream)
 	status := 0
 	succeeded := false
@@ -594,6 +639,11 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 502, "upstream request failed")
 	}
 	a.record(account, request, status, succeeded, started)
+}
+
+func isWorkBuddyCompatibleAgent(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-API-Mock-WorkBuddy-Compatible")), "1") ||
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("X-API-Mock-Pi-WorkBuddy")), "1")
 }
 
 func isWorkBuddyConversationTopic(r *http.Request) bool {
@@ -648,8 +698,6 @@ func workBuddyProfileHeader(profile map[string]string, name string) string {
 }
 
 func applyNativeWorkBuddyProfile(request map[string]any) {
-	delete(request, "tools")
-	delete(request, "tool_choice")
 }
 
 func writeWorkBuddyConversationTopic(w http.ResponseWriter, model string) {
@@ -691,6 +739,32 @@ func (a *app) record(account Account, request map[string]any, status int, succee
 	a.mu.Unlock()
 }
 
+func (a *app) captureOutgoing(body []byte, headers map[string]string) {
+	if a.outgoingCaptureDir == "" || !json.Valid(body) {
+		return
+	}
+	if os.MkdirAll(a.outgoingCaptureDir, 0o700) != nil {
+		return
+	}
+	stem := time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + randomString(8)
+	profile := make(map[string]string, len(headers))
+	for name, value := range headers {
+		lower := strings.ToLower(name)
+		if lower == "authorization" || lower == "x-api-key" || strings.Contains(lower, "token") || strings.Contains(lower, "secret") {
+			continue
+		}
+		profile[name] = value
+	}
+	encoded, err := json.Marshal(map[string]any{"headers": profile})
+	if err != nil {
+		return
+	}
+	if os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".json"), body, 0o600) != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".profile.json"), encoded, 0o600)
+}
+
 type sseErrorDetector struct {
 	line   []byte
 	failed bool
@@ -723,6 +797,66 @@ func applyWorkBuddyRequestProfile(request map[string]any, modelInstructions stri
 	request["reasoning_effort"] = "low"
 	request["temperature"] = 1
 	request["stream_options"] = map[string]any{"include_usage": true}
+}
+
+func applyOpenAICompatibleProfile(request map[string]any) {
+	if maxTokens, ok := request["max_completion_tokens"]; ok {
+		request["max_tokens"] = maxTokens
+	}
+	for _, field := range []string{"max_completion_tokens", "reasoning_effort", "store", "stream_options", "tools", "tool_choice"} {
+		delete(request, field)
+	}
+	request["stream"] = false
+	request["temperature"] = 0
+	messages, _ := request["messages"].([]any)
+	normalized := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if message["role"] == "developer" {
+			continue
+		}
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		var text strings.Builder
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "text" {
+				continue
+			}
+			if value, ok := part["text"].(string); ok {
+				text.WriteString(value)
+			}
+		}
+		message["content"] = text.String()
+		normalized = append(normalized, message)
+	}
+	request["messages"] = normalized
+}
+
+func applyAgentWorkBuddyProfile(request map[string]any, modelInstructions string, workBuddyTools []any) {
+	delete(request, "max_completion_tokens")
+	delete(request, "store")
+	if messages, ok := request["messages"].([]any); ok {
+		filtered := make([]any, 0, len(messages))
+		for _, raw := range messages {
+			message, ok := raw.(map[string]any)
+			if ok && (message["role"] == "system" || message["role"] == "developer") {
+				continue
+			}
+			filtered = append(filtered, raw)
+		}
+		request["messages"] = filtered
+	}
+	if _, hasTools := request["tools"].([]any); !hasTools && len(workBuddyTools) > 0 {
+		request["tools"] = workBuddyTools
+		delete(request, "tool_choice")
+	}
+	applyWorkBuddyRequestProfile(request, modelInstructions)
 }
 
 func prependModelInstructions(request map[string]any, instructions string) {
