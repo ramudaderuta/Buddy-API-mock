@@ -151,6 +151,51 @@ API_MOCK_PROMPT_RESPONSE_LANGUAGE=your-language
 
 普通 Agent 请求的 `tools` 和 `tool_choice` 会原样转发；服务不再注入 WorkBuddy 工具。
 
+#### Pi 与其他 Agent 的工具兼容模式
+
+需要让普通 Agent 使用 function tools 时，在该 Agent 的 OpenAI Chat Completions
+provider 上设置以下请求头：
+
+```text
+X-API-Mock-WorkBuddy-Compatible: 1
+X-API-Mock-Account-ID: <enabled-account-id>
+```
+
+第一个头启用 WorkBuddy 上游画像；第二个头可选，用来固定选择账户池中的一个已启用账户。
+它们是客户端请求头，不是部署服务器的 `.env` 变量。兼容模式会移除客户端的
+`system` / `developer` 消息及 Pi 专有的 `max_completion_tokens`、`store`，注入私有
+WorkBuddy 系统提示词，并保留客户端的 `tools`、`tool_choice`、assistant
+`tool_calls` 和 `tool` 结果。因此 function 名称及参数 schema 应由客户端自己定义。
+
+Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。示例中的 ID
+和 Key 均为占位符：
+
+```json
+{
+  "providers": {
+    "local-workbuddy": {
+      "baseUrl": "http://127.0.0.1:13100/v1",
+      "api": "openai-completions",
+      "apiKey": "<relay-api-key>",
+      "headers": {
+        "X-API-Mock-Account-ID": "<enabled-account-id>",
+        "X-API-Mock-WorkBuddy-Compatible": "1"
+      },
+      "models": [{ "id": "<model-id>" }]
+    }
+  }
+}
+```
+
+其他支持自定义 OpenAI Chat Completions provider 的 Agent，例如 OpenClaw，应配置相同的
+base URL、relay API Key 和两个请求头，并使用标准 function `tools`、assistant
+`tool_calls` 及 `role: "tool"` 结果消息。`X-API-Mock-WorkBuddy-Compatible` 不会对
+其他 provider 自动生效；每个 client/provider 都必须显式设置。
+
+仅实现 Chat Completions 的 function-tool 路径。OpenAI Responses、Anthropic Messages、
+MCP 和没有自定义请求头能力的客户端需要独立适配。OpenClaw 尚未在此仓库环境完成真实
+运行验证。
+
 挂载为只读，文件不会复制到镜像或 `api-mock-data` 卷。Linux/WSL 宿主机应让服务账户
 `65532` 可读取这两个私有文件；Windows Docker Desktop 的 bind mount 通常不需要额外调整。
 仅验证容器内文件存在且运行账户可读时，可执行：
