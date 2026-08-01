@@ -368,8 +368,14 @@ function render() {
         <button class="nav ${view === 'records' ? 'active' : ''}" type="button" data-view="records">☷ <span>请求记录</span></button>
         <button class="nav ${view === 'api' ? 'active' : ''}" type="button" data-view="api">▷ <span>API</span></button>
         <div class="sideActions">
-          <button class="sideAction" id="diagnostics" type="button">⌁ <span>诊断</span></button>
-          <button class="sideAction" id="logout" type="button">↪ <span>退出</span></button>
+          <button class="sideAction" id="diagnostics" type="button" title="运行诊断">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+            <span>诊断</span>
+          </button>
+          <button class="sideAction" id="logout" type="button" title="退出登录">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>
+            <span>退出</span>
+          </button>
         </div>
       </aside>
       <main class="main">
@@ -448,12 +454,17 @@ async function diagnosticsModal() {
     const wrap = document.createElement('div');
     wrap.className = 'modalBack';
     wrap.innerHTML = `
-      <section class="modal diagnostics" role="dialog" aria-modal="true" aria-label="运行诊断">
+      <section class="modal modalWide diagnostics" role="dialog" aria-modal="true" aria-label="运行诊断">
         <div class="modalHead">
           <h2>运行诊断</h2>
-          <button type="button" class="icon" id="close">×</button>
+          <button type="button" class="icon modalClose" id="close" aria-label="关闭"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
         </div>
-        <div class="diagnosticSummary"><strong>服务已就绪</strong><span>账户池和本地运行状态可读取</span></div>
+        <div class="diagnosticSummary ${diagnostics.ok ? 'ok' : ''}">
+          <span class="diagnosticIcon">${diagnostics.ok
+            ? '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>'
+            : '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>'}</span>
+          <div><b>${diagnostics.ok ? '服务已就绪' : '仍有待处理项'}</b><small>${diagnostics.ok ? '账户池和本地转发服务均可用' : '检查账户池与部署环境变量'}</small></div>
+        </div>
         <details open><summary>诊断 JSON</summary><pre>${esc(JSON.stringify(diagnostics, null, 2))}</pre></details>
       </section>`;
     document.body.append(wrap);
