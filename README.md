@@ -159,22 +159,16 @@ provider 上设置以下请求头：
 
 ```text
 X-API-Mock-WorkBuddy-Compatible: 1
-X-API-Mock-Account-ID: <enabled-account-id>
 ```
 
-第一个头启用 WorkBuddy 上游画像；第二个头可选，用来固定选择账户池中的一个已启用账户。
-它们是客户端请求头，不是部署服务器的 `.env` 变量。兼容模式会移除客户端的
-`system` / `developer` 消息及 Pi 专有的 `max_completion_tokens`、`store`，注入私有
-WorkBuddy 系统提示词，并保留客户端的 `tools`、`tool_choice`、assistant
-`tool_calls` 和 `tool` 结果。因此 function 名称及参数 schema 应由客户端自己定义。
+该请求头启用 WorkBuddy 上游画像，并且是客户端请求头，不是部署服务器的 `.env` 变量。
+兼容模式会移除客户端的 `system` / `developer` 消息及 Pi 专有的
+`max_completion_tokens`、`store`，注入私有 WorkBuddy 系统提示词，并保留客户端的
+`tools`、`tool_choice`、assistant `tool_calls` 和 `tool` 结果。因此 function 名称及参数
+schema 应由客户端自己定义。Relay 根据请求体中的模型 ID，在配置了相同模型 ID 的已启用
+账户中应用当前调度策略。
 
-不带 `X-API-Mock-Account-ID` 时，relay 根据当前账户池调度策略自动选择可用账户；带上时
-只使用该内部 ID 对应的已启用账户。账户不存在或已禁用会返回
-`503 requested account is unavailable`。该 ID 仅用于 relay 本地选账户，不会转发到上游，
-也不等于 WorkBuddy 用户 ID、上游账号或 API Key。不同部署的数据卷具有独立账户池，不能
-复用另一台部署中的账户 ID。
-
-Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。示例中的 ID
+Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。示例中的模型 ID
 和 Key 均为占位符：
 
 ```json
@@ -185,7 +179,6 @@ Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。�
       "api": "openai-completions",
       "apiKey": "<relay-api-key>",
       "headers": {
-        "X-API-Mock-Account-ID": "<enabled-account-id>",
         "X-API-Mock-WorkBuddy-Compatible": "1"
       },
       "models": [{ "id": "<model-id>" }]
@@ -195,7 +188,7 @@ Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。�
 ```
 
 其他支持自定义 OpenAI Chat Completions provider 的 Agent，例如 OpenClaw，应配置相同的
-base URL、relay API Key 和两个请求头，并使用标准 function `tools`、assistant
+base URL、relay API Key 和兼容请求头，并使用标准 function `tools`、assistant
 `tool_calls` 及 `role: "tool"` 结果消息。`X-API-Mock-WorkBuddy-Compatible` 不会对
 其他 provider 自动生效；每个 client/provider 都必须显式设置。
 
@@ -243,14 +236,25 @@ docker compose -f docker-compose.yml down
 
 ## 调用转发 API
 
-客户端必须携带本服务的 `API_MOCK_API_KEY`（与控制台管理员密码、上游账户 Key 都不同）：
+客户端必须携带本服务的 `API_MOCK_API_KEY`（与控制台管理员密码、上游账户 Key 都不同）。
+可先读取账户池中已启用账户提供的模型 ID；结果会去重并按 ID 排序：
+
+```bash
+curl http://127.0.0.1:13100/v1/models \
+  -H "Authorization: Bearer $API_MOCK_API_KEY"
+```
+
+再使用返回的模型 ID 发起请求：
 
 ```bash
 curl http://127.0.0.1:13100/v1/chat/completions \
   -H "Authorization: Bearer $API_MOCK_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"<model-id>","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+Relay 只在已启用且配置了相同模型 ID 的账户中应用当前调度策略，并以账户配置的模型 ID
+转发请求；没有匹配账户时返回 `503 requested model is unavailable`。
 
 也支持 `X-API-Key: <API_MOCK_API_KEY>`。缺少或错误时返回 `401 invalid api key`。
 

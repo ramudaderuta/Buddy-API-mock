@@ -15,13 +15,20 @@ docker compose -f docker-compose.yml up -d
 
 浏览器打开 `http://127.0.0.1:13100`，使用管理员密码登录控制台。
 
-客户端调用中转服务时使用**中转 API Key**：
+客户端调用中转服务时使用**中转 API Key**。先读取已启用账户提供的模型 ID：
+
+```bash
+curl http://127.0.0.1:13100/v1/models \
+  -H "Authorization: Bearer $API_MOCK_API_KEY"
+```
+
+再使用返回的模型 ID 调用 Chat Completions：
 
 ```bash
 curl http://127.0.0.1:13100/v1/chat/completions \
   -H "Authorization: Bearer $API_MOCK_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"<model-id>","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 默认镜像：`docker.io/ramudaderuta/buddy-api-mock:latest`。

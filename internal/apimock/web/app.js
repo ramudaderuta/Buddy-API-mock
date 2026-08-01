@@ -188,9 +188,10 @@ function recordPage() {
 function apiPage() {
   const endpoint = `${location.origin}/v1/chat/completions`;
   const enabled = accounts.filter((account) => account.enabled);
-  const options = enabled.map((account) => `<option value="${esc(account.id)}">${esc(account.label)} · ${esc(account.model)}</option>`).join('');
-  const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Reply with OK."}]}'`;
-  const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
+  const models = [...new Set(enabled.map((account) => account.model.trim()).filter(Boolean))].sort();
+  const options = models.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join('');
+  const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","messages":[{"role":"user","content":"Reply with OK."}]}'`;
+  const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
   return `
     <section class="apiGuide">
       <div class="panel guideCopy">
@@ -206,9 +207,9 @@ function apiPage() {
       <div class="panel tryPanel">
         <div class="sectionTitle"><div><h2>发送测试请求</h2><small>使用服务器已配置的 Relay Key</small></div></div>
         <form class="form testForm" id="api-test">
-          <label>账户 / 模型<select name="account" ${enabled.length ? '' : 'disabled'}>${options}</select></label>
+          <label>模型<select name="model" ${models.length ? '' : 'disabled'}>${options}</select></label>
           <label>输入<textarea name="message" rows="5">你好，请简要介绍你自己。</textarea></label>
-          <div class="formActions"><label class="toggle"><input name="stream" type="checkbox"><span></span>流式响应</label><button class="primary" type="submit" ${enabled.length ? '' : 'disabled'}>▷ 发送</button></div>
+          <div class="formActions"><label class="toggle"><input name="stream" type="checkbox"><span></span>流式响应</label><button class="primary" type="submit" ${models.length ? '' : 'disabled'}>▷ 发送</button></div>
         </form>
         <div class="response"><div><b>响应</b><small>正文不会写入请求记录</small></div><pre id="api-output">等待请求</pre></div>
       </div>
@@ -254,8 +255,8 @@ function bindShell() {
 
   if (view === 'api') {
     const endpoint = `${location.origin}/v1/chat/completions`;
-    const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Reply with OK."}]}'`;
-    const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
+    const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","messages":[{"role":"user","content":"Reply with OK."}]}'`;
+    const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
     const copyValues = { endpoint, json: jsonCurl, sse: sseCurl };
     document.querySelectorAll('[data-copy]').forEach((button) => {
       button.onclick = async () => {
@@ -271,9 +272,9 @@ function bindShell() {
     if (form) form.onsubmit = async (event) => {
       event.preventDefault();
       if (busy) return;
-      const account = accounts.find((item) => item.id === form.account.value && item.enabled);
-      if (!account) {
-        showToast('请选择可用账户', 'error');
+      const model = form.model.value.trim();
+      if (!model) {
+        showToast('请选择可用模型', 'error');
         return;
       }
       const output = document.querySelector('#api-output');
@@ -286,9 +287,8 @@ function bindShell() {
       try {
         const response = await apiResponse('/api/test', {
           method: 'POST',
-          headers: { 'X-API-Mock-Account-ID': account.id },
           body: JSON.stringify({
-            model: account.model,
+            model,
             stream,
             messages: [{ role: 'user', content: form.message.value }],
           }),

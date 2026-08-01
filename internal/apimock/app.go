@@ -310,6 +310,7 @@ func (a *app) save() error {
 }
 
 func (a *app) routes(m *http.ServeMux) {
+	m.HandleFunc("GET /v1/models", a.models)
 	m.HandleFunc("POST /v1/chat/completions", a.chat)
 	m.HandleFunc("POST /api/login", a.login)
 	m.HandleFunc("POST /api/logout", a.logout)
@@ -436,7 +437,7 @@ func (a *app) accounts(w http.ResponseWriter, r *http.Request) {
 		Label, Endpoint, APIKey, Model string
 		Enabled                        bool
 	}
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Label == "" || in.APIKey == "" || in.Model == "" {
+	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Label == "" || in.APIKey == "" || normalizeModelID(in.Model) == "" {
 		appErr(w, 400, "label, API key, and model are required")
 		return
 	}
@@ -450,7 +451,7 @@ func (a *app) accounts(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 500, "unable to encrypt account")
 		return
 	}
-	a.state.Accounts = append(a.state.Accounts, Account{ID: randomString(9), Label: in.Label, Endpoint: endpoint, Model: in.Model, Enabled: in.Enabled, Key: key, CreatedAt: time.Now().UTC()})
+	a.state.Accounts = append(a.state.Accounts, Account{ID: randomString(9), Label: in.Label, Endpoint: endpoint, Model: normalizeModelID(in.Model), Enabled: in.Enabled, Key: key, CreatedAt: time.Now().UTC()})
 	_ = a.save()
 	jsonOut(w, 201, map[string]bool{"ok": true})
 }
@@ -512,24 +513,24 @@ func normalizeEndpoint(raw string) (string, error) {
 	u.Path = strings.TrimSuffix(u.Path, "/chat/completions")
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
-func (a *app) choose(preferredID string) (Account, error) {
+
+func normalizeModelID(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
+func (a *app) choose(model string) (Account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if preferredID != "" {
-		for _, account := range a.state.Accounts {
-			if account.ID == preferredID && account.Enabled {
-				return account, nil
-			}
-		}
-		return Account{}, errors.New("requested account is unavailable")
-	}
 	available := make([]int, 0)
 	for i, x := range a.state.Accounts {
-		if x.Enabled {
+		if x.Enabled && (model == "" || normalizeModelID(x.Model) == model) {
 			available = append(available, i)
 		}
 	}
 	if len(available) == 0 {
+		if model != "" {
+			return Account{}, errors.New("requested model is unavailable")
+		}
 		return Account{}, errors.New("account pool exhausted")
 	}
 	index := available[0]
@@ -538,7 +539,9 @@ func (a *app) choose(preferredID string) (Account, error) {
 		a.state.Cursor++
 		_ = a.save()
 	}
-	return a.state.Accounts[index], nil
+	account := a.state.Accounts[index]
+	account.Model = normalizeModelID(account.Model)
+	return account, nil
 }
 func clientAPIKey(r *http.Request) string {
 	if raw := strings.TrimSpace(r.Header.Get("Authorization")); raw != "" {
@@ -566,6 +569,33 @@ func (a *app) authorizeAPI(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(a.apiKey)) == 1
 }
 
+func (a *app) models(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeAPI(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		appErr(w, 401, "invalid api key")
+		return
+	}
+	a.mu.Lock()
+	unique := make(map[string]struct{})
+	for _, account := range a.state.Accounts {
+		model := normalizeModelID(account.Model)
+		if account.Enabled && model != "" {
+			unique[model] = struct{}{}
+		}
+	}
+	a.mu.Unlock()
+	ids := make([]string, 0, len(unique))
+	for id := range unique {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	data := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "api-mock"})
+	}
+	jsonOut(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
 func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	if !a.authorizeAPI(r) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
@@ -582,13 +612,23 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 400, "messages is required")
 		return
 	}
-	account, e := a.choose(strings.TrimSpace(r.Header.Get("X-API-Mock-Account-ID")))
-	if e != nil {
-		appErr(w, 503, e.Error())
+	model, ok := request["model"].(string)
+	model = normalizeModelID(model)
+	if !ok || model == "" {
+		appErr(w, 400, "model is required")
 		return
 	}
 	if _, ok := request["messages"].([]any); !ok {
 		appErr(w, 400, "messages is required")
+		return
+	}
+	selectionModel := model
+	if isWorkBuddyConversationTopic(r) {
+		selectionModel = ""
+	}
+	account, e := a.choose(selectionModel)
+	if e != nil {
+		appErr(w, 503, e.Error())
 		return
 	}
 	started := time.Now()
