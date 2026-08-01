@@ -237,14 +237,14 @@ docker compose -f docker-compose.yml down
 ## 调用转发 API
 
 客户端必须携带本服务的 `API_MOCK_API_KEY`（与控制台管理员密码、上游账户 Key 都不同）。
-可先读取账户池中已启用账户提供的模型 ID；结果会去重并按 ID 排序：
+先查询账户池中已启用账户提供的模型 ID；结果会去重并按 ID 排序：
 
 ```bash
 curl http://127.0.0.1:13100/v1/models \
   -H "Authorization: Bearer $API_MOCK_API_KEY"
 ```
 
-再使用返回的模型 ID 发起请求：
+从响应的 `data` 数组中选择一个对象的 `id`，填入下方的 `<model-id>`，再发起请求：
 
 ```bash
 curl http://127.0.0.1:13100/v1/chat/completions \

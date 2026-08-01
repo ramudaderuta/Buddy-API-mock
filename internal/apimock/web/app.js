@@ -187,22 +187,29 @@ function recordPage() {
 
 function apiPage() {
   const endpoint = `${location.origin}/v1/chat/completions`;
+  const modelsEndpoint = endpoint.replace('/chat/completions', '/models');
   const enabled = accounts.filter((account) => account.enabled);
   const models = [...new Set(enabled.map((account) => account.model.trim()).filter(Boolean))].sort();
   const options = models.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join('');
   const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","messages":[{"role":"user","content":"Reply with OK."}]}'`;
   const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
+  const modelsCurl = `curl ${modelsEndpoint} -H "Authorization: Bearer $API_MOCK_API_KEY"`;
+  const jsonExample = `# 1. 查询可用模型 ID\n${modelsCurl}\n\n# 2. 将响应 data 数组中的 id 填入 <model-id>\n${jsonCurl}`;
+  const sseExample = `# 1. 查询可用模型 ID\n${modelsCurl}\n\n# 2. 将响应 data 数组中的 id 填入 <model-id>\n${sseCurl}`;
   return `
     <section class="apiGuide">
       <div class="panel guideCopy">
         <div class="sectionTitle"><div><h2>快速开始</h2><small>OpenAI Chat Completions 兼容接口</small></div></div>
         <dl class="referenceList">
           <div><dt>Endpoint</dt><dd><code>${esc(endpoint)}</code><button class="icon copy" type="button" data-copy="endpoint" title="复制 Endpoint">⎘</button></dd></div>
+          <div><dt>查询模型</dt><dd><code>${esc(modelsEndpoint)}</code><button class="icon copy" type="button" data-copy="models" title="复制模型查询命令">⎘</button></dd></div>
           <div><dt>认证</dt><dd><code>Bearer 或 X-API-Key</code></dd></div>
           <div><dt>账户</dt><dd>${enabled.map((account) => `<span>${esc(account.label)} · ${esc(account.model)}</span>`).join('') || '尚无可用账户'}</dd></div>
         </dl>
-        <div class="codeHead"><b>JSON curl</b><button class="secondary" type="button" data-copy="json">⎘ 复制</button></div><pre>${esc(jsonCurl)}</pre>
-        <div class="codeHead"><b>SSE curl</b><button class="secondary" type="button" data-copy="sse">⎘ 复制</button></div><pre>${esc(sseCurl)}</pre>
+        <div class="codeHead"><b>1. 查询模型</b><button class="secondary" type="button" data-copy="models">⎘ 复制</button></div><pre>${esc(modelsCurl)}</pre>
+        <p class="hint">从响应的 <code>data</code> 数组中选择一个对象的 <code>id</code>，填入下方的 <code>&lt;model-id&gt;</code>。</p>
+        <div class="codeHead"><b>2. JSON curl</b><button class="secondary" type="button" data-copy="json">⎘ 复制</button></div><pre>${esc(jsonExample)}</pre>
+        <div class="codeHead"><b>2. SSE curl</b><button class="secondary" type="button" data-copy="sse">⎘ 复制</button></div><pre>${esc(sseExample)}</pre>
       </div>
       <div class="panel tryPanel">
         <div class="sectionTitle"><div><h2>发送测试请求</h2><small>使用服务器已配置的 Relay Key</small></div></div>
@@ -257,7 +264,11 @@ function bindShell() {
     const endpoint = `${location.origin}/v1/chat/completions`;
     const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","messages":[{"role":"user","content":"Reply with OK."}]}'`;
     const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
-    const copyValues = { endpoint, json: jsonCurl, sse: sseCurl };
+    const modelsEndpoint = endpoint.replace('/chat/completions', '/models');
+    const modelsCurl = `curl ${modelsEndpoint} -H "Authorization: Bearer $API_MOCK_API_KEY"`;
+    const jsonExample = `# 1. 查询可用模型 ID\n${modelsCurl}\n\n# 2. 将响应 data 数组中的 id 填入 <model-id>\n${jsonCurl}`;
+    const sseExample = `# 1. 查询可用模型 ID\n${modelsCurl}\n\n# 2. 将响应 data 数组中的 id 填入 <model-id>\n${sseCurl}`;
+    const copyValues = { endpoint, models: modelsCurl, json: jsonExample, sse: sseExample };
     document.querySelectorAll('[data-copy]').forEach((button) => {
       button.onclick = async () => {
         try {

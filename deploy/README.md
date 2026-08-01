@@ -15,14 +15,14 @@ docker compose -f docker-compose.yml up -d
 
 浏览器打开 `http://127.0.0.1:13100`，使用管理员密码登录控制台。
 
-客户端调用中转服务时使用**中转 API Key**。先读取已启用账户提供的模型 ID：
+客户端调用中转服务时使用**中转 API Key**。先查询已启用账户提供的模型 ID：
 
 ```bash
 curl http://127.0.0.1:13100/v1/models \
   -H "Authorization: Bearer $API_MOCK_API_KEY"
 ```
 
-再使用返回的模型 ID 调用 Chat Completions：
+从响应的 `data` 数组中选择一个对象的 `id`，填入下方的 `<model-id>`，再调用 Chat Completions：
 
 ```bash
 curl http://127.0.0.1:13100/v1/chat/completions \
