@@ -314,6 +314,7 @@ func (a *app) routes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/login", a.login)
 	m.HandleFunc("POST /api/logout", a.logout)
 	m.HandleFunc("GET /api/session", a.session)
+	m.HandleFunc("GET /api/diagnostics", a.guard(a.diagnostics))
 	m.HandleFunc("GET /api/accounts", a.guard(a.accounts))
 	m.HandleFunc("POST /api/accounts", a.guard(a.accounts))
 	m.HandleFunc("DELETE /api/accounts/{id}", a.guard(a.account))
@@ -374,6 +375,24 @@ func (a *app) logout(w http.ResponseWriter, r *http.Request) {
 func (a *app) session(w http.ResponseWriter, r *http.Request) {
 	_, csrf := a.auth(r)
 	jsonOut(w, 200, map[string]any{"authenticated": csrf != "", "csrf": csrf})
+}
+func (a *app) diagnostics(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	available := 0
+	for _, account := range a.state.Accounts {
+		if account.Enabled {
+			available++
+		}
+	}
+	jsonOut(w, 200, map[string]any{
+		"ok":                  true,
+		"accountsTotal":       len(a.state.Accounts),
+		"accountsAvailable":   available,
+		"records":             len(a.state.Records),
+		"strategy":            a.state.Strategy,
+		"configurationSource": "environment",
+	})
 }
 func (a *app) auth(r *http.Request) (string, string) {
 	c, e := r.Cookie("api_mock_session")

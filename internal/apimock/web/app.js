@@ -199,6 +199,23 @@ function bindShell() {
     };
   });
 
+  document.querySelector('#diagnostics').onclick = diagnosticsModal;
+  document.querySelector('#logout').onclick = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      await api('/api/logout', { method: 'POST' });
+      csrf = '';
+      accounts = [];
+      records = [];
+      login();
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      busy = false;
+    }
+  };
+
   if (view !== 'accounts') return;
 
   const addButton = document.querySelector('#add');
@@ -254,6 +271,10 @@ function render() {
         <div class="brand"><i>B</i><span>Buddy-API-mock</span></div>
         <button class="nav ${view === 'accounts' ? 'active' : ''}" type="button" data-view="accounts">◫ <span>账户池</span></button>
         <button class="nav ${view === 'records' ? 'active' : ''}" type="button" data-view="records">☷ <span>请求记录</span></button>
+        <div class="sideActions">
+          <button class="sideAction" id="diagnostics" type="button">⌁ <span>诊断</span></button>
+          <button class="sideAction" id="logout" type="button">↪ <span>退出</span></button>
+        </div>
       </aside>
       <main class="main">
         <header class="top">
@@ -322,6 +343,32 @@ function modal() {
       busy = false;
     }
   };
+}
+
+async function diagnosticsModal() {
+  if (document.querySelector('.modalBack')) return;
+  try {
+    const diagnostics = await api('/api/diagnostics');
+    const wrap = document.createElement('div');
+    wrap.className = 'modalBack';
+    wrap.innerHTML = `
+      <section class="modal diagnostics" role="dialog" aria-modal="true" aria-label="运行诊断">
+        <div class="modalHead">
+          <h2>运行诊断</h2>
+          <button type="button" class="icon" id="close">×</button>
+        </div>
+        <div class="diagnosticSummary"><strong>服务已就绪</strong><span>账户池和本地运行状态可读取</span></div>
+        <details open><summary>诊断 JSON</summary><pre>${esc(JSON.stringify(diagnostics, null, 2))}</pre></details>
+      </section>`;
+    document.body.append(wrap);
+    const close = () => wrap.remove();
+    wrap.querySelector('#close').onclick = close;
+    wrap.addEventListener('click', (event) => {
+      if (event.target === wrap) close();
+    });
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
 }
 
 (async () => {
