@@ -8,14 +8,20 @@ let busy = false;
 let toastTimer = 0;
 let toastHideTimer = 0;
 
-async function api(path, init = {}) {
+async function apiResponse(path, init = {}) {
   const headers = new Headers(init.headers || {});
   if (init.body) headers.set('Content-Type', 'application/json');
   if (init.method && init.method !== 'GET') headers.set('X-CSRF-Token', csrf);
   const response = await fetch(path, { ...init, headers, credentials: 'same-origin' });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw Error(body.error?.message || '请求失败');
-  return body;
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw Error(body.error?.message || '请求失败');
+  }
+  return response;
+}
+
+async function api(path, init = {}) {
+  return (await apiResponse(path, init)).json();
 }
 
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -179,6 +185,36 @@ function recordPage() {
     </section>`;
 }
 
+function apiPage() {
+  const endpoint = `${location.origin}/v1/chat/completions`;
+  const enabled = accounts.filter((account) => account.enabled);
+  const options = enabled.map((account) => `<option value="${esc(account.id)}">${esc(account.label)} · ${esc(account.model)}</option>`).join('');
+  const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Reply with OK."}]}'`;
+  const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
+  return `
+    <section class="apiGuide">
+      <div class="panel guideCopy">
+        <div class="sectionTitle"><div><h2>快速开始</h2><small>OpenAI Chat Completions 兼容接口</small></div></div>
+        <dl class="referenceList">
+          <div><dt>Endpoint</dt><dd><code>${esc(endpoint)}</code><button class="icon copy" type="button" data-copy="endpoint" title="复制 Endpoint">⎘</button></dd></div>
+          <div><dt>认证</dt><dd><code>Bearer 或 X-API-Key</code></dd></div>
+          <div><dt>账户</dt><dd>${enabled.map((account) => `<span>${esc(account.label)} · ${esc(account.model)}</span>`).join('') || '尚无可用账户'}</dd></div>
+        </dl>
+        <div class="codeHead"><b>JSON curl</b><button class="secondary" type="button" data-copy="json">⎘ 复制</button></div><pre>${esc(jsonCurl)}</pre>
+        <div class="codeHead"><b>SSE curl</b><button class="secondary" type="button" data-copy="sse">⎘ 复制</button></div><pre>${esc(sseCurl)}</pre>
+      </div>
+      <div class="panel tryPanel">
+        <div class="sectionTitle"><div><h2>发送测试请求</h2><small>使用服务器已配置的 Relay Key</small></div></div>
+        <form class="form testForm" id="api-test">
+          <label>账户 / 模型<select name="account" ${enabled.length ? '' : 'disabled'}>${options}</select></label>
+          <label>输入<textarea name="message" rows="5">你好，请简要介绍你自己。</textarea></label>
+          <div class="formActions"><label class="toggle"><input name="stream" type="checkbox"><span></span>流式响应</label><button class="primary" type="submit" ${enabled.length ? '' : 'disabled'}>▷ 发送</button></div>
+        </form>
+        <div class="response"><div><b>响应</b><small>正文不会写入请求记录</small></div><pre id="api-output">等待请求</pre></div>
+      </div>
+    </section>`;
+}
+
 function bindShell() {
   document.querySelectorAll('[data-view]').forEach((button) => {
     button.onclick = async () => {
@@ -215,6 +251,65 @@ function bindShell() {
       busy = false;
     }
   };
+
+  if (view === 'api') {
+    const endpoint = `${location.origin}/v1/chat/completions`;
+    const jsonCurl = `curl ${endpoint} \\\n  -H "Authorization: Bearer $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Reply with OK."}]}'`;
+    const sseCurl = `curl -N ${endpoint} \\\n  -H "X-API-Key: $API_MOCK_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Reply with OK."}]}'`;
+    const copyValues = { endpoint, json: jsonCurl, sse: sseCurl };
+    document.querySelectorAll('[data-copy]').forEach((button) => {
+      button.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(copyValues[button.dataset.copy]);
+          showToast('已复制');
+        } catch {
+          showToast('复制失败', 'error');
+        }
+      };
+    });
+    const form = document.querySelector('#api-test');
+    if (form) form.onsubmit = async (event) => {
+      event.preventDefault();
+      if (busy) return;
+      const account = accounts.find((item) => item.id === form.account.value && item.enabled);
+      if (!account) {
+        showToast('请选择可用账户', 'error');
+        return;
+      }
+      const output = document.querySelector('#api-output');
+      const submit = form.querySelector('button[type="submit"]');
+      const stream = form.stream.checked;
+      busy = true;
+      submit.disabled = true;
+      submit.textContent = '请求中';
+      output.textContent = '请求中…';
+      try {
+        const response = await apiResponse('/api/test', {
+          method: 'POST',
+          headers: { 'X-API-Mock-Account-ID': account.id },
+          body: JSON.stringify({
+            model: account.model,
+            stream,
+            messages: [{ role: 'user', content: form.message.value }],
+          }),
+        });
+        if (stream) {
+          output.textContent = await response.text();
+        } else {
+          output.textContent = JSON.stringify(await response.json(), null, 2);
+        }
+        await load();
+      } catch (error) {
+        output.textContent = error.message;
+        showToast(error.message, 'error');
+      } finally {
+        busy = false;
+        submit.disabled = false;
+        submit.textContent = '▷ 发送';
+      }
+    };
+    return;
+  }
 
   if (view !== 'accounts') return;
 
@@ -271,6 +366,7 @@ function render() {
         <div class="brand"><i>B</i><span>Buddy-API-mock</span></div>
         <button class="nav ${view === 'accounts' ? 'active' : ''}" type="button" data-view="accounts">◫ <span>账户池</span></button>
         <button class="nav ${view === 'records' ? 'active' : ''}" type="button" data-view="records">☷ <span>请求记录</span></button>
+        <button class="nav ${view === 'api' ? 'active' : ''}" type="button" data-view="api">▷ <span>API</span></button>
         <div class="sideActions">
           <button class="sideAction" id="diagnostics" type="button">⌁ <span>诊断</span></button>
           <button class="sideAction" id="logout" type="button">↪ <span>退出</span></button>
@@ -279,11 +375,11 @@ function render() {
       <main class="main">
         <header class="top">
           <div>
-            <h1>${view === 'accounts' ? '账户池' : '请求记录'}</h1>
-            <p>${view === 'accounts' ? '管理上游账户与本地调度策略' : '仅保存元数据，不保存提示词、密钥或上游响应'}</p>
+            <h1>${view === 'accounts' ? '账户池' : view === 'records' ? '请求记录' : 'API'}</h1>
+            <p>${view === 'accounts' ? '管理上游账户与本地调度策略' : view === 'records' ? '仅保存元数据，不保存提示词、密钥或上游响应' : '查看调用示例并发送测试请求'}</p>
           </div>
         </header>
-        ${view === 'accounts' ? accountPage() : recordPage()}
+        ${view === 'accounts' ? accountPage() : view === 'records' ? recordPage() : apiPage()}
       </main>
     </div>`;
   bindShell();

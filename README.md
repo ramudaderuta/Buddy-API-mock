@@ -9,7 +9,7 @@ Completions 中转控制台。它通过本地账户池转发请求，只持久�
 ## 功能概览
 
 - 标准 `POST /v1/chat/completions` 中转（JSON / SSE）
-- 管理员密码登录的本机控制台：账户池、请求记录
+- 管理员密码登录的本机控制台：账户池、请求记录、API
 - 调度策略：默认 **填充优先**，可切换 **轮询优先**
 - 账户 Endpoint 必须为 HTTPS；本地 AES-GCM 加密保存 API Key
 - 内置固定系统提示词；原生 WorkBuddy 正式请求保留其消息画像并移除内置工具声明
@@ -255,6 +255,10 @@ curl http://127.0.0.1:13100/v1/chat/completions \
 也支持 `X-API-Key: <API_MOCK_API_KEY>`。缺少或错误时返回 `401 invalid api key`。
 
 上游真实密钥在控制台「账户池」中配置；转发时由服务自动替换请求头。
+
+控制台「API」页面位于「请求记录」下方，提供 JSON/SSE curl 示例和测试请求表单。
+已登录管理员发送测试请求时，服务器通过受 CSRF 保护的内部路由使用已配置的
+`API_MOCK_API_KEY`；浏览器不会读取、接收或持久化该 Relay Key。
 
 ## 管理员密码与数据卷
 

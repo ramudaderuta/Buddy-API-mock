@@ -319,6 +319,7 @@ func (a *app) routes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/accounts", a.guard(a.accounts))
 	m.HandleFunc("DELETE /api/accounts/{id}", a.guard(a.account))
 	m.HandleFunc("GET /api/records", a.guard(a.records))
+	m.HandleFunc("POST /api/test", a.guard(a.testChat))
 	m.HandleFunc("POST /api/strategy", a.guard(a.strategy))
 	m.HandleFunc("/", a.web)
 }
@@ -658,6 +659,13 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 502, "upstream request failed")
 	}
 	a.record(account, request, status, succeeded, started)
+}
+
+func (a *app) testChat(w http.ResponseWriter, r *http.Request) {
+	request := r.Clone(r.Context())
+	request.Header = r.Header.Clone()
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	a.chat(w, request)
 }
 
 func isWorkBuddyCompatibleAgent(r *http.Request) bool {
