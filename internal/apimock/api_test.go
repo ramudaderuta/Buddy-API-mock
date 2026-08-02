@@ -18,6 +18,23 @@ func testAPIApp() (*app, http.Handler) {
 	return a, mux
 }
 
+func TestSidebarStaysInViewportOnDesktop(t *testing.T) {
+	css, err := assets.ReadFile("web/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(css)
+	for _, rule := range []string{
+		".shell{display:grid;grid-template-columns:230px 1fr;align-items:start;min-height:100vh}",
+		".side{position:sticky;top:0;display:flex;flex-direction:column;height:100vh;height:100dvh;overflow-y:auto",
+		".side{position:static;display:flex;flex-direction:row;height:auto;min-height:0;overflow:visible",
+	} {
+		if !strings.Contains(text, rule) {
+			t.Fatalf("app.css missing sidebar layout rule %q", rule)
+		}
+	}
+}
+
 func TestAPITestRequiresAdministratorSession(t *testing.T) {
 	_, handler := testAPIApp()
 	request := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(`{}`))
