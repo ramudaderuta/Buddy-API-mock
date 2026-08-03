@@ -48,7 +48,8 @@ services:
     volumes:
       - api-mock-data:/data
       - ${API_MOCK_PRIVATE_PROFILE_DIR:-./.private/workbuddy-profile}:/private-profile:ro
-      - ${API_MOCK_OUTGOING_CAPTURE_HOST_DIR:-./.private/outgoing-captures}:/outgoing-captures
+      - api-mock-captures:/outgoing-captures
 
 volumes:
   api-mock-data:
+  api-mock-captures:

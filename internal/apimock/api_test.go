@@ -152,6 +152,28 @@ func TestChatRequiresModel(t *testing.T) {
 	}
 }
 
+func TestChatRejectsOversizedRequestWithStandard413(t *testing.T) {
+	a, handler := testAPIApp()
+	oversized := `{"model":"model-a","messages":[{"role":"user","content":"` + strings.Repeat("x", maxRequestBodyBytes) + `"}]}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(oversized))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	errorBody, _ := payload["error"].(map[string]any)
+	if errorBody["type"] != "invalid_request_error" || errorBody["code"] != "request_too_large" {
+		t.Fatalf("unexpected error: %#v", payload)
+	}
+}
+
 func TestChatRejectsUnavailableModel(t *testing.T) {
 	a, handler := testAPIApp()
 	a.state.Accounts = []Account{{ID: "account-a", Model: "model-a", Enabled: true}}
@@ -163,6 +185,198 @@ func TestChatRejectsUnavailableModel(t *testing.T) {
 
 	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "requested model is unavailable") {
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+}
+
+func TestChatPassesNonStreamingJSONThroughWithoutForcingSSE(t *testing.T) {
+	var upstreamRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("X-Request-Id", "request-1")
+		jsonOut(w, http.StatusOK, map[string]any{
+			"id": "chatcmpl-1", "object": "chat.completion", "model": "model-a",
+			"choices": []any{map[string]any{
+				"index": 0, "message": map[string]any{"role": "assistant", "content": "OK"}, "finish_reason": "stop",
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.client = upstream.Client()
+	key, err := a.encrypt("upstream-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.state.Accounts = []Account{{ID: "account-a", Endpoint: upstream.URL, Model: "model-a", Enabled: true, Key: key}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[{"role":"user","content":"Reply OK"}],"stream":false,"stream_options":{"include_usage":true}}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	request.Header.Set("X-API-Mock-WorkBuddy-Compatible", "1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if upstreamRequest["stream"] != false {
+		t.Fatalf("upstream stream = %#v, want false", upstreamRequest["stream"])
+	}
+	if _, ok := upstreamRequest["stream_options"]; ok {
+		t.Fatalf("non-streaming upstream request retained stream_options: %#v", upstreamRequest)
+	}
+	if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := response.Header().Get("X-Request-Id"); got != "request-1" {
+		t.Fatalf("X-Request-Id = %q", got)
+	}
+	if len(a.state.Records) != 1 || a.state.Records[0].Stream {
+		t.Fatalf("unexpected record: %#v", a.state.Records)
+	}
+}
+
+func TestChatPreservesMaxCompletionTokensUpstream(t *testing.T) {
+	var upstreamRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		jsonOut(w, http.StatusOK, map[string]any{"choices": []any{}})
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.client = upstream.Client()
+	key, err := a.encrypt("upstream-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.state.Accounts = []Account{{ID: "account-a", Endpoint: upstream.URL, Model: "model-a", Enabled: true, Key: key}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":false,"max_completion_tokens":128,"max_tokens":64}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	request.Header.Set("X-API-Mock-WorkBuddy-Compatible", "1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || upstreamRequest["max_completion_tokens"] != float64(128) {
+		t.Fatalf("status=%d upstream=%#v", response.Code, upstreamRequest)
+	}
+	if _, exists := upstreamRequest["max_tokens"]; exists {
+		t.Fatalf("conflicting max_tokens reached upstream: %#v", upstreamRequest)
+	}
+}
+
+func TestChatPassesNonStreamingToolJSONThrough(t *testing.T) {
+	var upstreamStream any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		upstreamStream = request["stream"]
+		jsonOut(w, http.StatusOK, map[string]any{
+			"id": "chatcmpl-tools", "object": "chat.completion", "model": "model-a",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"message": map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+					"id": "call_1", "type": "function", "function": map[string]any{"name": "get_weather", "arguments": `{"city":"Paris"}`},
+				}}},
+				"finish_reason": "tool_calls",
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.client = upstream.Client()
+	key, err := a.encrypt("upstream-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.state.Accounts = []Account{{ID: "account-a", Endpoint: upstream.URL, Model: "model-a", Enabled: true, Key: key}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":false,"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	request.Header.Set("X-API-Mock-WorkBuddy-Compatible", "1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || upstreamStream != false {
+		t.Fatalf("status = %d, upstream stream = %#v, body = %q", response.Code, upstreamStream, response.Body.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	choice := result["choices"].([]any)[0].(map[string]any)
+	message := choice["message"].(map[string]any)
+	if !strings.EqualFold(choice["finish_reason"].(string), "tool_calls") || len(message["tool_calls"].([]any)) != 1 {
+		t.Fatalf("unexpected completion: %#v", result)
+	}
+}
+
+func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
+	var upstreamRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.client = upstream.Client()
+	key, err := a.encrypt("upstream-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.state.Accounts = []Account{{ID: "account-a", Endpoint: upstream.URL, Model: "model-a", Enabled: true, Key: key}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	request.Header.Set("X-API-Mock-WorkBuddy-Compatible", "1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if upstreamRequest["stream"] != true {
+		t.Fatalf("upstream stream = %#v, want true", upstreamRequest["stream"])
+	}
+	options, ok := upstreamRequest["stream_options"].(map[string]any)
+	if !ok || options["include_usage"] != true {
+		t.Fatalf("missing upstream stream options: %#v", upstreamRequest)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-cache, no-transform" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := response.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q", got)
+	}
+	if !strings.Contains(response.Body.String(), "data: [DONE]") {
+		t.Fatalf("body = %q", response.Body.String())
+	}
+	if len(a.state.Records) != 1 || !a.state.Records[0].Stream {
+		t.Fatalf("unexpected record: %#v", a.state.Records)
 	}
 }
 

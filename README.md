@@ -8,12 +8,13 @@ Completions 中转控制台。它通过本地账户池转发请求，只持久�
 
 ## 功能概览
 
-- 标准 `POST /v1/chat/completions` 中转（JSON / SSE）
+- 标准 `POST /v1/chat/completions` 中转：原样传递客户端的 `stream` 语义，`stream:true` 透传 SSE，`stream:false` 透传标准 JSON（包括 `tool_calls`）
 - 管理员密码登录的本机控制台：账户池、请求记录、API
 - 调度策略：默认 **填充优先**，可切换 **轮询优先**
 - 账户 Endpoint 必须为 HTTPS；本地 AES-GCM 加密保存 API Key
 - 内置固定系统提示词；原生 WorkBuddy 正式请求保留其消息画像并移除内置工具声明
 - WorkBuddy 的 `conversation_topic` 阶段在本地返回固定标题 SSE，不向上游发送该阶段的提示词；正式 `conversation` 仍使用账户池转发
+- 内置固定弱网策略：连接/TLS/首包分段超时、HTTP 连接池、SSE 逐块 flush、20 秒 heartbeat、180 秒上游流空闲保护，以及仅在请求尚未写出时进行的安全重试和同模型账户切换
 
 ## 本机直接运行
 
@@ -29,7 +30,7 @@ go run ./cmd/api-mock
 http://127.0.0.1:13100/v1/chat/completions
 ```
 
-发送标准 Chat Completions 请求。
+发送标准 Chat Completions 请求。本服务会遵循并原样传递客户端的 `stream` 参数：`false`（或省略）时要求上游返回单个 `chat.completion` JSON，`true` 时透传 `chat.completion.chunk` SSE。当前验证的 WorkBuddy 上游原生支持这两种模式，因此不在本地重放或聚合响应。
 
 ## 私有 Docker 部署
 
@@ -191,6 +192,27 @@ Pi 的 `models.json` 将 `headers` 放在 **provider**，而不是 model 项。�
 base URL、relay API Key 和兼容请求头，并使用标准 function `tools`、assistant
 `tool_calls` 及 `role: "tool"` 结果消息。`X-API-Mock-WorkBuddy-Compatible` 不会对
 其他 provider 自动生效；每个 client/provider 都必须显式设置。
+
+兼容模式保留 `max_completion_tokens`；如果请求同时包含旧的 `max_tokens`，只保留
+`max_completion_tokens`，避免冲突。当前已验证上游原生支持 `stream:false` JSON、
+`stream:true` SSE、工具选择和工具结果回填。`n > 1` 和 `logprobs` 虽会被转发，但当前
+上游会静默忽略，客户端不应依赖这两项能力。
+
+### 固定弱网策略
+
+所有参数固化在程序中，不通过环境变量覆盖：TCP 连接 10 秒、TLS 握手 10 秒、等待响应头
+180 秒、非流式完整请求 10 分钟、SSE 上游 180 秒无新字节即终止、下游 SSE 每 20 秒发送
+标准注释 heartbeat。连接池最多保留 100 个空闲连接、每个上游 20 个空闲连接、每个上游
+最多 50 个总连接。
+
+仅当 HTTP tracing 证明请求尚未写给上游时，Relay 才会执行最多 3 次尝试（250ms、750ms
+退避并带少量 jitter），并可切换到下一个同模型健康账户。收到任何 HTTP 响应、请求已经
+写出、已经向客户端发送字节、SSE 中途断开或客户端取消时都不会透明重放，以避免重复计费、
+重复文本或重复工具副作用。连续 3 次安全的 pre-write 网络失败会让账户冷却 60 秒。
+
+SSE 响应会设置 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`，每次
+收到上游数据后立即 flush；heartbeat 只维护 Relay 到客户端/Cloudflare 的空闲链路，不提供
+模型输出断点续传。中途断流会失败，不会拼接第二次生成。
 
 仅实现 Chat Completions 的 function-tool 路径。OpenAI Responses、Anthropic Messages、
 MCP 和没有自定义请求头能力的客户端需要独立适配。OpenClaw 尚未在此仓库环境完成真实

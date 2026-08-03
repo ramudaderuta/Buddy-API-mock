@@ -1,6 +1,7 @@
 package apimock
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -90,12 +91,11 @@ func TestApplyWorkBuddyRequestProfile(t *testing.T) {
 
 	applyWorkBuddyRequestProfile(request, "system contract")
 
-	if request["stream"] != true || request["reasoning_effort"] != "low" || request["temperature"] != 1 {
+	if request["stream"] != false || request["reasoning_effort"] != "low" || request["temperature"] != 1 {
 		t.Fatalf("unexpected WorkBuddy request profile: %#v", request)
 	}
-	streamOptions, ok := request["stream_options"].(map[string]any)
-	if !ok || streamOptions["include_usage"] != true {
-		t.Fatalf("missing stream usage option: %#v", request["stream_options"])
+	if _, ok := request["stream_options"]; ok {
+		t.Fatalf("non-streaming request retained stream options: %#v", request["stream_options"])
 	}
 	if _, ok := request["tools"]; ok {
 		t.Fatalf("unexpected injected tools: %#v", request["tools"])
@@ -113,6 +113,39 @@ func TestApplyWorkBuddyRequestProfile(t *testing.T) {
 	}
 	if messages[1].(map[string]any)["content"] != "hello" {
 		t.Fatalf("unexpected WorkBuddy user content: %#v", messages[0])
+	}
+}
+
+func TestApplyWorkBuddyRequestProfileAddsUsageOptionsOnlyWhenStreaming(t *testing.T) {
+	request := map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		"stream":   true,
+	}
+
+	applyWorkBuddyRequestProfile(request, "system contract")
+
+	if request["stream"] != true {
+		t.Fatalf("stream flag changed: %#v", request)
+	}
+	streamOptions, ok := request["stream_options"].(map[string]any)
+	if !ok || streamOptions["include_usage"] != true {
+		t.Fatalf("missing stream usage option: %#v", request["stream_options"])
+	}
+}
+
+func TestApplyWorkBuddyRequestProfileDefaultsMissingStreamToFalse(t *testing.T) {
+	request := map[string]any{
+		"messages":       []any{map[string]any{"role": "user", "content": "hello"}},
+		"stream_options": map[string]any{"include_usage": true},
+	}
+
+	applyWorkBuddyRequestProfile(request, "system contract")
+
+	if request["stream"] != false {
+		t.Fatalf("missing stream must default to false: %#v", request)
+	}
+	if _, ok := request["stream_options"]; ok {
+		t.Fatalf("default non-streaming request retained stream options: %#v", request)
 	}
 }
 
@@ -197,10 +230,84 @@ func TestNativeWorkBuddyProfilePreservesWorkBuddyToolSettings(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleProfilePreservesStringAndFlattensTypedContent(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "plain text"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "text", "text": "typed "},
+				map[string]any{"type": "text", "text": "text"},
+			}},
+			map[string]any{"role": "developer", "content": "removed"},
+		},
+	}
+
+	applyOpenAICompatibleProfile(payload)
+
+	messages := payload["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0].(map[string]any)["content"] != "plain text" || messages[1].(map[string]any)["content"] != "typed text" {
+		t.Fatalf("content normalization failed: %#v", messages)
+	}
+}
+
+func TestRedactCaptureBodyKeepsShapeAndRemovesPrivateValues(t *testing.T) {
+	body := []byte(`{"model":"model-a","messages":[{"role":"system","content":"private system"},{"role":"user","content":[{"type":"text","text":"private user"},{"type":"image_url","image_url":{"url":"https://private.example/image"}}]},{"role":"assistant","tool_calls":[{"id":"call-private","function":{"name":"lookup","arguments":"{\"secret\":true}"}}]},{"role":"tool","tool_call_id":"call-private","content":"private result"}],"user":"private-user","metadata":{"request_id":"private-request","safe":"kept"},"api_key":"private-key"}`)
+
+	redacted, err := redactCaptureBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(redacted)
+	for _, private := range []string{"private system", "private user", "private.example", "call-private", `\"secret\"`, "private result", "private-user", "private-request", "private-key"} {
+		if strings.Contains(text, private) {
+			t.Fatalf("capture retained %q: %s", private, text)
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(redacted, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["model"] != "model-a" || payload["messages"] == nil || payload["metadata"].(map[string]any)["safe"] != "kept" {
+		t.Fatalf("capture shape was not retained: %#v", payload)
+	}
+}
+
+func TestCaptureOutgoingRedactsBodyAndHeaderIdentifiers(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{outgoingCaptureDir: dir}
+	a.captureOutgoing(
+		[]byte(`{"model":"model-a","messages":[{"role":"user","content":"private message"}]}`),
+		map[string]string{"Authorization": "Bearer private", "X-User-ID": "private-user", "User-Agent": "test-agent"},
+	)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("capture files = %d", len(entries))
+	}
+	for _, entry := range entries {
+		body, err := os.ReadFile(dir + "/" + entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		if strings.Contains(text, "private message") || strings.Contains(text, "Bearer private") || strings.Contains(text, "private-user") {
+			t.Fatalf("private value reached %s: %s", entry.Name(), text)
+		}
+		if entry.Type().Perm() != 0 {
+			t.Fatalf("unexpected directory entry type: %s", entry.Name())
+		}
+	}
+}
+
 func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 	payload := map[string]any{
 		"max_completion_tokens": 128,
-		"reasoning_effort":       "medium",
+		"reasoning_effort":      "medium",
 		"store":                 false,
 		"tools":                 []any{map[string]any{"type": "function"}},
 		"tool_choice":           "auto",
@@ -210,8 +317,8 @@ func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 		},
 	}
 	applyAgentWorkBuddyProfile(payload, "WorkBuddy system", nil)
-	if _, ok := payload["max_completion_tokens"]; ok {
-		t.Fatalf("Pi output-token field must be removed: %#v", payload)
+	if payload["max_completion_tokens"] != 128 {
+		t.Fatalf("Pi output-token field must be preserved: %#v", payload)
 	}
 	if _, ok := payload["store"]; ok {
 		t.Fatalf("Pi store field must be removed: %#v", payload)
@@ -219,12 +326,29 @@ func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 	if got := len(payload["tools"].([]any)); got != 1 || payload["tool_choice"] != "auto" {
 		t.Fatalf("Pi tools must be preserved: %#v", payload)
 	}
-	if payload["reasoning_effort"] != "medium" || payload["temperature"] != 1 || payload["stream"] != true {
+	if payload["reasoning_effort"] != "medium" || payload["temperature"] != 1 || payload["stream"] != false {
 		t.Fatalf("WorkBuddy request profile was not applied: %#v", payload)
 	}
 	messages := payload["messages"].([]any)
 	if len(messages) != 2 || messages[0].(map[string]any)["content"] != "WorkBuddy system" || messages[1].(map[string]any)["role"] != "user" {
 		t.Fatalf("Pi system prompt must be replaced: %#v", payload)
+	}
+}
+
+func TestPiWorkBuddyProfilePrefersMaxCompletionTokensOverMaxTokens(t *testing.T) {
+	payload := map[string]any{
+		"max_completion_tokens": 128,
+		"max_tokens":            64,
+		"messages":              []any{map[string]any{"role": "user", "content": "hello"}},
+	}
+
+	applyAgentWorkBuddyProfile(payload, "WorkBuddy system", nil)
+
+	if payload["max_completion_tokens"] != 128 {
+		t.Fatalf("max_completion_tokens changed: %#v", payload)
+	}
+	if _, ok := payload["max_tokens"]; ok {
+		t.Fatalf("conflicting max_tokens must be removed: %#v", payload)
 	}
 }
 

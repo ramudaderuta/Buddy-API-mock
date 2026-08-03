@@ -1,6 +1,7 @@
 package apimock
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,6 +62,7 @@ type app struct {
 	workBuddyUserID    string
 	workBuddyTools     []any
 	outgoingCaptureDir string
+	health             map[string]*accountHealth
 }
 
 func Run() error {
@@ -93,13 +96,13 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: &http.Client{Timeout: 10 * time.Minute}, modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID, workBuddyTools: workBuddyTools, outgoingCaptureDir: strings.TrimSpace(os.Getenv("API_MOCK_OUTGOING_CAPTURE_DIR"))}
+	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: newUpstreamHTTPClient(), modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID, workBuddyTools: workBuddyTools, outgoingCaptureDir: strings.TrimSpace(os.Getenv("API_MOCK_OUTGOING_CAPTURE_DIR")), health: map[string]*accountHealth{}}
 	if err := a.load(); err != nil {
 		return err
 	}
 	mux := http.NewServeMux()
 	a.routes(mux)
-	return http.ListenAndServe(listen, mux)
+	return newHTTPServer(listen, mux).ListenAndServe()
 }
 
 func env(key, fallback string) string {
@@ -518,30 +521,89 @@ func normalizeModelID(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
-func (a *app) choose(model string) (Account, error) {
+func (a *app) candidateAccounts(model string) ([]Account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	available := make([]int, 0)
-	for i, x := range a.state.Accounts {
-		if x.Enabled && (model == "" || normalizeModelID(x.Model) == model) {
-			available = append(available, i)
+	if a.health == nil {
+		a.health = map[string]*accountHealth{}
+	}
+	now := time.Now()
+	available := make([]Account, 0)
+	matched := false
+	for _, account := range a.state.Accounts {
+		if !account.Enabled || (model != "" && normalizeModelID(account.Model) != model) {
+			continue
 		}
+		matched = true
+		health := a.health[account.ID]
+		if health != nil && health.CooldownUntil.After(now) {
+			continue
+		}
+		account.Model = normalizeModelID(account.Model)
+		available = append(available, account)
 	}
 	if len(available) == 0 {
-		if model != "" {
-			return Account{}, errors.New("requested model is unavailable")
+		if matched {
+			return nil, errors.New("matching accounts are temporarily unavailable")
 		}
-		return Account{}, errors.New("account pool exhausted")
+		if model != "" {
+			return nil, errors.New("requested model is unavailable")
+		}
+		return nil, errors.New("account pool exhausted")
 	}
-	index := available[0]
 	if a.state.Strategy == "round_robin" {
-		index = available[a.state.Cursor%len(available)]
+		start := a.state.Cursor % len(available)
+		rotated := append(append([]Account{}, available[start:]...), available[:start]...)
+		available = rotated
 		a.state.Cursor++
 		_ = a.save()
 	}
-	account := a.state.Accounts[index]
-	account.Model = normalizeModelID(account.Model)
-	return account, nil
+	return available, nil
+}
+
+func (a *app) choose(model string) (Account, error) {
+	accounts, err := a.candidateAccounts(model)
+	if err != nil {
+		return Account{}, err
+	}
+	return accounts[0], nil
+}
+
+func (a *app) markAccountFailure(account Account, class string, latency time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.health == nil {
+		a.health = map[string]*accountHealth{}
+	}
+	health := a.health[account.ID]
+	if health == nil {
+		health = &accountHealth{}
+		a.health[account.ID] = health
+	}
+	health.ConsecutiveFailures++
+	health.LastErrorClass = class
+	health.LastLatency = latency
+	if health.ConsecutiveFailures >= accountFailureThreshold {
+		health.CooldownUntil = time.Now().Add(accountCooldownDuration)
+	}
+}
+
+func (a *app) markAccountSuccess(account Account, latency time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.health == nil {
+		a.health = map[string]*accountHealth{}
+	}
+	health := a.health[account.ID]
+	if health == nil {
+		health = &accountHealth{}
+		a.health[account.ID] = health
+	}
+	health.ConsecutiveFailures = 0
+	health.CooldownUntil = time.Time{}
+	health.LastErrorClass = ""
+	health.LastSuccessAt = time.Now().UTC()
+	health.LastLatency = latency
 }
 func clientAPIKey(r *http.Request) string {
 	if raw := strings.TrimSpace(r.Header.Get("Authorization")); raw != "" {
@@ -602,8 +664,14 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		appErr(w, 401, "invalid api key")
 		return
 	}
-	body, e := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	body, e := io.ReadAll(r.Body)
 	if e != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(e, &tooLarge) {
+			jsonOut(w, http.StatusRequestEntityTooLarge, map[string]any{"error": map[string]any{"message": "request body exceeds 8 MiB limit", "type": "invalid_request_error", "code": "request_too_large"}})
+			return
+		}
 		appErr(w, 400, "invalid request body")
 		return
 	}
@@ -626,11 +694,12 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	if isWorkBuddyConversationTopic(r) {
 		selectionModel = ""
 	}
-	account, e := a.choose(selectionModel)
+	accounts, e := a.candidateAccounts(selectionModel)
 	if e != nil {
 		appErr(w, 503, e.Error())
 		return
 	}
+	account := accounts[0]
 	started := time.Now()
 	if isWorkBuddyConversationTopic(r) {
 		writeWorkBuddyConversationTopic(w, account.Model)
@@ -651,50 +720,33 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		applyWorkBuddyRequestProfile(request, a.modelInstructions)
 	}
 	body, _ = json.Marshal(request)
-	key, e := a.decrypt(account.Key)
-	if e != nil {
-		appErr(w, 500, "account key unavailable")
-		return
-	}
-	upstream, e := http.NewRequestWithContext(r.Context(), http.MethodPost, account.Endpoint+"/chat/completions", strings.NewReader(string(body)))
-	if e != nil {
-		appErr(w, 502, "invalid upstream request")
-		return
-	}
-	headers := workBuddyHeaders(key, a.workBuddyUserID)
-	if openAICompatible {
-		headers = map[string]string{"Authorization": "Bearer " + key, "User-Agent": "curl/8.5.0", "Accept": "*/*"}
-	} else if nativeWorkBuddy {
-		overlayNativeWorkBuddyHeaders(headers, r.Header)
-	} else {
-		overlayWorkBuddyProfile(headers, a.workBuddyProfile)
-	}
-	for k, v := range headers {
-		upstream.Header.Set(k, v)
-	}
-	upstream.Header.Set("Content-Type", "application/json")
-	if workBuddyCompatible {
-		a.captureOutgoing(body, headers)
-	}
-	response, e := a.client.Do(upstream)
+	stream, _ := request["stream"].(bool)
+	response, usedAccount, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible)
+	account = usedAccount
 	status := 0
 	succeeded := false
 	if e == nil {
 		status = response.StatusCode
-		for _, h := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
-			if v := response.Header.Get(h); v != "" {
-				w.Header().Set(h, v)
-			}
+		copySafeResponseHeaders(w.Header(), response.Header)
+		isSSE := isSSEContentType(response.Header.Get("Content-Type"))
+		if isSSE {
+			w.Header().Set("Cache-Control", "no-cache, no-transform")
+			w.Header().Set("X-Accel-Buffering", "no")
+		} else if status < 400 {
+			w.Header().Set("Cache-Control", "no-store")
 		}
 		w.WriteHeader(response.StatusCode)
 		detector := &sseErrorDetector{}
-		reader := io.Reader(response.Body)
-		if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-			reader = io.TeeReader(response.Body, detector)
+		if isSSE {
+			e = copySSEWithHeartbeat(r.Context(), w, response.Body, detector)
+		} else {
+			_, e = io.Copy(w, response.Body)
 		}
-		_, _ = io.Copy(w, reader)
 		response.Body.Close()
-		succeeded = status < 400 && !detector.failed
+		if e != nil && !errors.Is(e, context.Canceled) {
+			log.Printf("upstream response interrupted: account_id=%s class=%s stream=%t", account.ID, classifyNetworkError(e), isSSE)
+		}
+		succeeded = e == nil && status < 400 && !detector.failed
 	} else {
 		appErr(w, 502, "upstream request failed")
 	}
@@ -807,7 +859,11 @@ func (a *app) record(account Account, request map[string]any, status int, succee
 }
 
 func (a *app) captureOutgoing(body []byte, headers map[string]string) {
-	if a.outgoingCaptureDir == "" || !json.Valid(body) {
+	if a.outgoingCaptureDir == "" {
+		return
+	}
+	redactedBody, err := redactCaptureBody(body)
+	if err != nil {
 		return
 	}
 	if os.MkdirAll(a.outgoingCaptureDir, 0o700) != nil {
@@ -817,7 +873,11 @@ func (a *app) captureOutgoing(body []byte, headers map[string]string) {
 	profile := make(map[string]string, len(headers))
 	for name, value := range headers {
 		lower := strings.ToLower(name)
-		if lower == "authorization" || lower == "x-api-key" || strings.Contains(lower, "token") || strings.Contains(lower, "secret") {
+		if lower == "authorization" || lower == "x-api-key" || strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") {
+			continue
+		}
+		if isCaptureIdentifierField(lower) {
+			profile[name] = "[REDACTED]"
 			continue
 		}
 		profile[name] = value
@@ -826,10 +886,56 @@ func (a *app) captureOutgoing(body []byte, headers map[string]string) {
 	if err != nil {
 		return
 	}
-	if os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".json"), body, 0o600) != nil {
+	if os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".json"), redactedBody, 0o600) != nil {
 		return
 	}
 	_ = os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".profile.json"), encoded, 0o600)
+}
+
+func redactCaptureBody(body []byte) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	redactCaptureValue(payload)
+	return json.Marshal(payload)
+}
+
+func redactCaptureValue(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for name, child := range typed {
+			lower := strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+			if isCaptureSecretField(lower) || isCaptureContentField(lower) || isCaptureIdentifierField(lower) {
+				typed[name] = "[REDACTED]"
+				continue
+			}
+			redactCaptureValue(child)
+		}
+	case []any:
+		for _, child := range typed {
+			redactCaptureValue(child)
+		}
+	}
+}
+
+func isCaptureSecretField(name string) bool {
+	return name == "authorization" || name == "api_key" || name == "apikey" || name == "password" ||
+		strings.Contains(name, "token") || strings.Contains(name, "secret")
+}
+
+func isCaptureContentField(name string) bool {
+	return name == "content" || name == "text" || name == "arguments" || name == "input" || name == "prompt" ||
+		name == "url" || name == "image_url"
+}
+
+func isCaptureIdentifierField(name string) bool {
+	name = strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+	return name == "id" || name == "user" || name == "traceparent" || name == "b3" ||
+		strings.HasSuffix(name, "user_id") || strings.HasSuffix(name, "request_id") ||
+		strings.HasSuffix(name, "conversation_id") || strings.HasSuffix(name, "message_id") ||
+		strings.HasSuffix(name, "tool_call_id") || strings.HasSuffix(name, "connection_id") ||
+		strings.HasSuffix(name, "trace_id") || strings.HasSuffix(name, "span_id")
 }
 
 type sseErrorDetector struct {
@@ -860,12 +966,17 @@ func (d *sseErrorDetector) inspectLine() {
 
 func applyWorkBuddyRequestProfile(request map[string]any, modelInstructions string) {
 	prependModelInstructions(request, modelInstructions)
-	request["stream"] = true
+	stream, _ := request["stream"].(bool)
+	request["stream"] = stream
 	if _, ok := request["reasoning_effort"]; !ok {
 		request["reasoning_effort"] = "low"
 	}
 	request["temperature"] = 1
-	request["stream_options"] = map[string]any{"include_usage": true}
+	if stream {
+		request["stream_options"] = map[string]any{"include_usage": true}
+	} else {
+		delete(request, "stream_options")
+	}
 }
 
 func applyOpenAICompatibleProfile(request map[string]any) {
@@ -887,28 +998,29 @@ func applyOpenAICompatibleProfile(request map[string]any) {
 		if message["role"] == "developer" {
 			continue
 		}
-		parts, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		var text strings.Builder
-		for _, rawPart := range parts {
-			part, ok := rawPart.(map[string]any)
-			if !ok || part["type"] != "text" {
-				continue
+		parts, typedContent := message["content"].([]any)
+		if typedContent {
+			var text strings.Builder
+			for _, rawPart := range parts {
+				part, ok := rawPart.(map[string]any)
+				if !ok || part["type"] != "text" {
+					continue
+				}
+				if value, ok := part["text"].(string); ok {
+					text.WriteString(value)
+				}
 			}
-			if value, ok := part["text"].(string); ok {
-				text.WriteString(value)
-			}
+			message["content"] = text.String()
 		}
-		message["content"] = text.String()
 		normalized = append(normalized, message)
 	}
 	request["messages"] = normalized
 }
 
 func applyAgentWorkBuddyProfile(request map[string]any, modelInstructions string, workBuddyTools []any) {
-	delete(request, "max_completion_tokens")
+	if _, hasCompletionCap := request["max_completion_tokens"]; hasCompletionCap {
+		delete(request, "max_tokens")
+	}
 	delete(request, "store")
 	if messages, ok := request["messages"].([]any); ok {
 		filtered := make([]any, 0, len(messages))
