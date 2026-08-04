@@ -37,11 +37,30 @@ type Account struct {
 }
 type Record struct {
 	ID, AccountID, AccountLabel, Model, Status string
+	Outcome, FailureClass                      string
 	HTTPStatus                                 int
-	Stream                                     bool
+	Stream, Completed                          bool
 	DurationMS                                 int64
 	At                                         time.Time
 }
+
+type requestResult struct {
+	Outcome      string
+	FailureClass string
+	HTTPStatus   int
+	Completed    bool
+}
+
+const (
+	outcomeSucceeded                 = "succeeded"
+	outcomeClientCanceled            = "client_canceled"
+	outcomeUpstreamHTTPError         = "upstream_http_error"
+	outcomeUpstreamSSEError          = "upstream_sse_error"
+	outcomeUpstreamStreamInterrupted = "upstream_stream_interrupted"
+	outcomeStreamIdleTimeout         = "stream_idle_timeout"
+	outcomeRequestFailed             = "request_failed"
+)
+
 type state struct {
 	Strategy string    `json:"strategy"`
 	Cursor   int       `json:"cursor"`
@@ -703,7 +722,7 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	if isWorkBuddyConversationTopic(r) {
 		writeWorkBuddyConversationTopic(w, account.Model)
-		a.record(account, request, http.StatusOK, true, started)
+		a.record(account, request, requestResult{Outcome: outcomeSucceeded, HTTPStatus: http.StatusOK, Completed: true}, started)
 		return
 	}
 	request["model"] = account.Model
@@ -721,18 +740,23 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ = json.Marshal(request)
 	stream, _ := request["stream"].(bool)
-	response, usedAccount, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible)
+	logicalRequestID := randomString(12)
+	response, usedAccount, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible, logicalRequestID)
 	account = usedAccount
-	status := 0
-	succeeded := false
+	result := requestResult{Outcome: outcomeRequestFailed, FailureClass: classifyNetworkError(e)}
+	if errors.Is(e, context.Canceled) {
+		result.Outcome = outcomeClientCanceled
+	} else if errors.Is(e, context.DeadlineExceeded) {
+		result.Outcome = outcomeStreamIdleTimeout
+	}
 	if e == nil {
-		status = response.StatusCode
+		result.HTTPStatus = response.StatusCode
 		copySafeResponseHeaders(w.Header(), response.Header)
 		isSSE := isSSEContentType(response.Header.Get("Content-Type"))
 		if isSSE {
 			w.Header().Set("Cache-Control", "no-cache, no-transform")
 			w.Header().Set("X-Accel-Buffering", "no")
-		} else if status < 400 {
+		} else if result.HTTPStatus < 400 {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		w.WriteHeader(response.StatusCode)
@@ -743,14 +767,19 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 			_, e = io.Copy(w, response.Body)
 		}
 		response.Body.Close()
+		result = classifyRequestResult(response.StatusCode, isSSE, e, detector)
 		if e != nil && !errors.Is(e, context.Canceled) {
-			log.Printf("upstream response interrupted: account_id=%s class=%s stream=%t", account.ID, classifyNetworkError(e), isSSE)
+			log.Printf("upstream response interrupted: account_id=%s class=%s stream=%t", account.ID, result.FailureClass, isSSE)
 		}
-		succeeded = e == nil && status < 400 && !detector.failed
+		if result.Outcome == outcomeSucceeded {
+			a.markAccountSuccess(account, time.Since(started))
+		} else if shouldPenalizeAccount(result) {
+			a.markAccountFailure(account, result.FailureClass, time.Since(started))
+		}
 	} else {
 		appErr(w, 502, "upstream request failed")
 	}
-	a.record(account, request, status, succeeded, started)
+	a.record(account, request, result, started)
 }
 
 func (a *app) testChat(w http.ResponseWriter, r *http.Request) {
@@ -843,14 +872,62 @@ func writeWorkBuddyConversationTopic(w http.ResponseWriter, model string) {
 	}
 }
 
-func (a *app) record(account Account, request map[string]any, status int, succeeded bool, started time.Time) {
+func classifyRequestResult(status int, isSSE bool, err error, detector *sseErrorDetector) requestResult {
+	result := requestResult{HTTPStatus: status}
+	switch {
+	case status >= http.StatusBadRequest:
+		result.Outcome = outcomeUpstreamHTTPError
+		result.FailureClass = "http_status"
+	case detector != nil && detector.failed:
+		result.Outcome = outcomeUpstreamSSEError
+		result.FailureClass = "sse_error"
+	case errors.Is(err, context.Canceled):
+		result.Outcome = outcomeClientCanceled
+		result.FailureClass = "client_cancel"
+	case errors.Is(err, context.DeadlineExceeded):
+		result.Outcome = outcomeStreamIdleTimeout
+		result.FailureClass = "timeout"
+	case err != nil:
+		result.Outcome = outcomeUpstreamStreamInterrupted
+		result.FailureClass = classifyNetworkError(err)
+	case isSSE && (detector == nil || !detector.sawDone):
+		result.Outcome = outcomeUpstreamStreamInterrupted
+		result.FailureClass = "incomplete_sse"
+	default:
+		result.Outcome = outcomeSucceeded
+		result.Completed = true
+	}
+	if isSSE && detector != nil && detector.sawDone && result.Outcome == outcomeSucceeded {
+		result.Completed = true
+	}
+	return result
+}
+
+func shouldPenalizeAccount(result requestResult) bool {
+	return result.Outcome == outcomeUpstreamSSEError ||
+		result.Outcome == outcomeUpstreamStreamInterrupted ||
+		result.Outcome == outcomeStreamIdleTimeout ||
+		(result.Outcome == outcomeUpstreamHTTPError && result.HTTPStatus >= http.StatusInternalServerError)
+}
+
+func legacyStatus(outcome string) string {
+	if outcome == outcomeSucceeded {
+		return "succeeded"
+	}
+	if outcome == outcomeClientCanceled {
+		return "canceled"
+	}
+	return "failed"
+}
+
+func (a *app) record(account Account, request map[string]any, result requestResult, started time.Time) {
 	a.mu.Lock()
 	for i := range a.state.Accounts {
 		if a.state.Accounts[i].ID == account.ID {
 			a.state.Accounts[i].LastUsedAt = time.Now().UTC()
 		}
 	}
-	a.state.Records = append([]Record{{ID: randomString(8), AccountID: account.ID, AccountLabel: account.Label, Model: account.Model, Status: map[bool]string{true: "succeeded", false: "failed"}[succeeded], HTTPStatus: status, Stream: request["stream"] == true, DurationMS: time.Since(started).Milliseconds(), At: time.Now().UTC()}}, a.state.Records...)
+	a.state.Records = append([]Record{{ID: randomString(8), AccountID: account.ID, AccountLabel: account.Label, Model: account.Model, Status: legacyStatus(result.Outcome), Outcome: result.Outcome, FailureClass: result.FailureClass, HTTPStatus: result.HTTPStatus, Stream: request["stream"] == true, Completed: result.Completed, DurationMS: time.Since(started).Milliseconds(), At: time.Now().UTC()}}, a.state.Records...)
 	if len(a.state.Records) > 100 {
 		a.state.Records = a.state.Records[:100]
 	}
@@ -858,7 +935,7 @@ func (a *app) record(account Account, request map[string]any, status int, succee
 	a.mu.Unlock()
 }
 
-func (a *app) captureOutgoing(body []byte, headers map[string]string) {
+func (a *app) captureOutgoing(body []byte, headers map[string]string, logicalRequestID string, attempt int) {
 	if a.outgoingCaptureDir == "" {
 		return
 	}
@@ -882,7 +959,7 @@ func (a *app) captureOutgoing(body []byte, headers map[string]string) {
 		}
 		profile[name] = value
 	}
-	encoded, err := json.Marshal(map[string]any{"headers": profile})
+	encoded, err := json.Marshal(map[string]any{"headers": profile, "request_id": logicalRequestID, "attempt": attempt})
 	if err != nil {
 		return
 	}
@@ -938,9 +1015,12 @@ func isCaptureIdentifierField(name string) bool {
 		strings.HasSuffix(name, "trace_id") || strings.HasSuffix(name, "span_id")
 }
 
+const maxSSEInspectionLineBytes = 64 << 10
+
 type sseErrorDetector struct {
-	line   []byte
-	failed bool
+	line    []byte
+	failed  bool
+	sawDone bool
 }
 
 func (d *sseErrorDetector) Write(p []byte) (int, error) {
@@ -950,7 +1030,7 @@ func (d *sseErrorDetector) Write(p []byte) (int, error) {
 			d.line = d.line[:0]
 			continue
 		}
-		if len(d.line) < 512 {
+		if len(d.line) < maxSSEInspectionLineBytes {
 			d.line = append(d.line, b)
 		}
 	}
@@ -959,8 +1039,23 @@ func (d *sseErrorDetector) Write(p []byte) (int, error) {
 
 func (d *sseErrorDetector) inspectLine() {
 	line := strings.TrimSpace(string(d.line))
-	if strings.EqualFold(line, "event: error") || strings.HasPrefix(line, `data: {"error":`) {
+	if strings.EqualFold(line, "event: error") {
 		d.failed = true
+		return
+	}
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "[DONE]" {
+		d.sawDone = true
+		return
+	}
+	var value map[string]any
+	if json.Unmarshal([]byte(payload), &value) == nil {
+		if _, ok := value["error"]; ok {
+			d.failed = true
+		}
 	}
 }
 

@@ -165,14 +165,30 @@ function accountPage() {
 }
 
 function recordPage() {
-  const rows = records.map((record) => `
+  const outcomeLabels = {
+    succeeded: '成功',
+    client_canceled: '客户端取消',
+    upstream_http_error: '上游 HTTP 错误',
+    upstream_sse_error: '上游流错误',
+    upstream_stream_interrupted: '上游流中断',
+    stream_idle_timeout: '流空闲超时',
+    request_failed: '请求失败',
+  };
+  const rows = records.map((record) => {
+    const outcome = record.Outcome || record.Status;
+    const failed = outcome !== 'succeeded' && outcome !== 'client_canceled';
+    const stateClass = failed ? 'failed' : outcome === 'client_canceled' ? 'canceled' : '';
+    const status = record.HTTPStatus || '网络错误';
+    const detail = record.FailureClass ? ` · ${esc(record.FailureClass)}` : '';
+    return `
     <tr>
       <td>${formatTime(record.At)}</td>
       <td>${esc(record.AccountLabel)}</td>
       <td>${esc(record.Model)}</td>
-      <td><span class="state ${record.Status === 'succeeded' ? '' : 'failed'}">${esc(record.HTTPStatus || '网络错误')} · ${esc(record.Status)}</span></td>
-      <td>${record.Stream ? '流式' : 'JSON'} · ${esc(record.DurationMS)} ms</td>
-    </tr>`).join('') || `<tr><td colspan="5" class="empty">尚无请求记录</td></tr>`;
+      <td><span class="state ${stateClass}">${esc(status)} · ${esc(outcomeLabels[outcome] || outcome)}${detail}</span></td>
+      <td>${record.Stream ? '流式' : 'JSON'} · ${record.Outcome ? (record.Completed ? '完整' : '未完整') : '历史记录'} · ${esc(record.DurationMS)} ms</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="5" class="empty">尚无请求记录</td></tr>`;
 
   return `
     <section class="panel table">

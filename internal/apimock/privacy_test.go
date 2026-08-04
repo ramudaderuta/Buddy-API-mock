@@ -281,6 +281,7 @@ func TestCaptureOutgoingRedactsBodyAndHeaderIdentifiers(t *testing.T) {
 	a.captureOutgoing(
 		[]byte(`{"model":"model-a","messages":[{"role":"user","content":"private message"}]}`),
 		map[string]string{"Authorization": "Bearer private", "X-User-ID": "private-user", "User-Agent": "test-agent"},
+		"request-test", 1,
 	)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -288,6 +289,13 @@ func TestCaptureOutgoingRedactsBodyAndHeaderIdentifiers(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("capture files = %d", len(entries))
+	}
+	profile, err := os.ReadFile(dir + "/" + entries[1].Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(profile), `"request_id":"request-test"`) || !strings.Contains(string(profile), `"attempt":1`) {
+		t.Fatalf("capture metadata missing: %s", profile)
 	}
 	for _, entry := range entries {
 		body, err := os.ReadFile(dir + "/" + entry.Name())
@@ -520,6 +528,23 @@ func TestSSEErrorDetectorHandlesChunkedEventLines(t *testing.T) {
 	}
 	if !detector.failed {
 		t.Fatal("expected SSE error event to be detected")
+	}
+}
+
+func TestSSEErrorDetectorParsesFlexibleJSONErrorsAndDone(t *testing.T) {
+	detector := &sseErrorDetector{}
+	_, _ = detector.Write([]byte("data: { \"message\": \"busy\", \"error\": {}}\n\ndata: [DONE]\n\n"))
+	if !detector.failed || !detector.sawDone {
+		t.Fatalf("detector = %#v", detector)
+	}
+}
+
+func TestSSEErrorDetectorHandlesLongJSONErrorEvent(t *testing.T) {
+	detector := &sseErrorDetector{}
+	line := `data: {"detail":"` + strings.Repeat("x", 2048) + `","error":{"type":"upstream_error"}}` + "\n\n"
+	_, _ = detector.Write([]byte(line))
+	if !detector.failed {
+		t.Fatal("long SSE JSON error event was not detected")
 	}
 }
 

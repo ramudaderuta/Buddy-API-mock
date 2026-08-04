@@ -1,12 +1,28 @@
 package apimock
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type cancelingReadCloser struct {
+	sent bool
+}
+
+func (r *cancelingReadCloser) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, context.Canceled
+	}
+	r.sent = true
+	return copy(p, "data: {\"choices\":[]}\n\n"), nil
+}
+
+func (r *cancelingReadCloser) Close() error { return nil }
 
 func testAPIApp() (*app, http.Handler) {
 	a := &app{
@@ -375,8 +391,58 @@ func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "data: [DONE]") {
 		t.Fatalf("body = %q", response.Body.String())
 	}
-	if len(a.state.Records) != 1 || !a.state.Records[0].Stream {
+	if len(a.state.Records) != 1 || !a.state.Records[0].Stream || a.state.Records[0].Outcome != outcomeSucceeded || !a.state.Records[0].Completed {
 		t.Fatalf("unexpected record: %#v", a.state.Records)
+	}
+}
+
+func TestChatRecordsClientCanceledStreamWithoutPenalizingAccount(t *testing.T) {
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.health = map[string]*accountHealth{}
+	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: &cancelingReadCloser{}, Request: request}, nil
+	})}
+	a.state.Accounts = []Account{encryptedTestAccount(t, a, "account-a", "https://upstream.example/v1", "model-a", "upstream-key")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if len(a.state.Records) != 1 || a.state.Records[0].Outcome != outcomeClientCanceled || a.state.Records[0].Status != "canceled" || a.state.Records[0].Completed {
+		t.Fatalf("unexpected record: %#v", a.state.Records)
+	}
+	if a.health["account-a"] != nil {
+		t.Fatalf("client cancellation affected account health: %#v", a.health["account-a"])
+	}
+}
+
+func TestChatRecordsIncompleteSSEAndPenalizesAccount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[]}\n\n")
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.key = make([]byte, 32)
+	a.health = map[string]*accountHealth{}
+	a.client = upstream.Client()
+	a.state.Accounts = []Account{encryptedTestAccount(t, a, "account-a", upstream.URL, "model-a", "upstream-key")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if len(a.state.Records) != 1 || a.state.Records[0].Outcome != outcomeUpstreamStreamInterrupted || a.state.Records[0].FailureClass != "incomplete_sse" || a.state.Records[0].Completed {
+		t.Fatalf("unexpected record: %#v", a.state.Records)
+	}
+	if a.health["account-a"] == nil || a.health["account-a"].ConsecutiveFailures != 1 {
+		t.Fatalf("incomplete stream did not affect account health: %#v", a.health["account-a"])
 	}
 }
 

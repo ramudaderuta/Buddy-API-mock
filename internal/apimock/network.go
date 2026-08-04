@@ -50,7 +50,7 @@ func newUpstreamHTTPClient() *http.Client {
 	}}
 }
 
-func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible bool) (*http.Response, Account, error) {
+func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible bool, logicalRequestID string) (*http.Response, Account, error) {
 	if len(accounts) == 0 {
 		return nil, Account{}, errors.New("no upstream accounts available")
 	}
@@ -98,16 +98,13 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 		}
 		upstream.Header.Set("Content-Type", "application/json")
 		if workBuddyCompatible {
-			a.captureOutgoing(body, headers)
+			a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
 		}
 		started := time.Now()
 		response, err := a.client.Do(upstream)
 		latency := time.Since(started)
 		if response != nil {
 			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
-			if response.StatusCode < http.StatusInternalServerError {
-				a.markAccountSuccess(used, latency)
-			}
 			return response, used, nil
 		}
 		cancel()

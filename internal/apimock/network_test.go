@@ -94,7 +94,7 @@ func TestSafeRetrySwitchesAccountsOnlyBeforeRequestWrite(t *testing.T) {
 		}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false)
+	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +105,8 @@ func TestSafeRetrySwitchesAccountsOnlyBeforeRequestWrite(t *testing.T) {
 	if a.health["first"].ConsecutiveFailures != 1 {
 		t.Fatalf("first account health = %#v", a.health["first"])
 	}
-	if a.health["second"].ConsecutiveFailures != 0 || a.health["second"].LastSuccessAt.IsZero() {
-		t.Fatalf("second account health = %#v", a.health["second"])
+	if a.health["second"] != nil {
+		t.Fatalf("response establishment must not mark account healthy before full response: %#v", a.health["second"])
 	}
 }
 
@@ -125,7 +125,7 @@ func TestSafeRetryNeverReplaysAfterRequestWrite(t *testing.T) {
 		return nil, io.ErrUnexpectedEOF
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	_, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false)
+	_, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("error = %v", err)
 	}
@@ -154,7 +154,7 @@ func TestHTTP503IsReturnedWithoutRetryOrHealthReset(t *testing.T) {
 		}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false)
+	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestClientCancellationNeverRetries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
-	_, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false)
+	_, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if !errors.Is(err, context.Canceled) || attempts != 1 {
 		t.Fatalf("error=%v attempts=%d", err, attempts)
 	}
@@ -207,7 +207,7 @@ func TestSafeRetryRechecksCooldownWithinSameRequest(t *testing.T) {
 		}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false)
+	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,5 +270,32 @@ func TestCopySSEStopsAfterIdleTimeout(t *testing.T) {
 	err := copySSE(context.Background(), response, reader, &sseErrorDetector{}, time.Second, 10*time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestClassifyRequestResultSeparatesStreamingOutcomes(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		err       error
+		detector  *sseErrorDetector
+		outcome   string
+		completed bool
+		penalize  bool
+	}{
+		{name: "complete", status: 200, detector: &sseErrorDetector{sawDone: true}, outcome: outcomeSucceeded, completed: true},
+		{name: "client canceled", status: 200, err: context.Canceled, detector: &sseErrorDetector{}, outcome: outcomeClientCanceled},
+		{name: "sse error", status: 200, detector: &sseErrorDetector{failed: true}, outcome: outcomeUpstreamSSEError, penalize: true},
+		{name: "incomplete eof", status: 200, detector: &sseErrorDetector{}, outcome: outcomeUpstreamStreamInterrupted, penalize: true},
+		{name: "idle timeout", status: 200, err: context.DeadlineExceeded, detector: &sseErrorDetector{}, outcome: outcomeStreamIdleTimeout, penalize: true},
+		{name: "http error", status: 503, detector: &sseErrorDetector{}, outcome: outcomeUpstreamHTTPError, penalize: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := classifyRequestResult(tt.status, true, tt.err, tt.detector)
+			if result.Outcome != tt.outcome || result.Completed != tt.completed || shouldPenalizeAccount(result) != tt.penalize {
+				t.Fatalf("result = %#v penalize=%t", result, shouldPenalizeAccount(result))
+			}
+		})
 	}
 }
