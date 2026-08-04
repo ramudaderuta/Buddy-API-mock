@@ -81,7 +81,7 @@ type app struct {
 	workBuddyUserID    string
 	workBuddyTools     []any
 	outgoingCaptureDir string
-	health             map[string]*accountHealth
+	retryWait          func(context.Context, time.Duration) bool
 }
 
 func Run() error {
@@ -115,7 +115,7 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: newUpstreamHTTPClient(), modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID, workBuddyTools: workBuddyTools, outgoingCaptureDir: strings.TrimSpace(os.Getenv("API_MOCK_OUTGOING_CAPTURE_DIR")), health: map[string]*accountHealth{}}
+	a := &app{dataPath: filepath.Join(dataDir, "api-mock.json"), key: key, password: password, apiKey: apiKey, sessions: map[string]string{}, client: newUpstreamHTTPClient(), modelInstructions: modelInstructions, workBuddyProfile: workBuddyProfile, workBuddyUserID: workBuddyUserID, workBuddyTools: workBuddyTools, outgoingCaptureDir: strings.TrimSpace(os.Getenv("API_MOCK_OUTGOING_CAPTURE_DIR"))}
 	if err := a.load(); err != nil {
 		return err
 	}
@@ -543,28 +543,15 @@ func normalizeModelID(raw string) string {
 func (a *app) candidateAccounts(model string) ([]Account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.health == nil {
-		a.health = map[string]*accountHealth{}
-	}
-	now := time.Now()
 	available := make([]Account, 0)
-	matched := false
 	for _, account := range a.state.Accounts {
 		if !account.Enabled || (model != "" && normalizeModelID(account.Model) != model) {
-			continue
-		}
-		matched = true
-		health := a.health[account.ID]
-		if health != nil && health.CooldownUntil.After(now) {
 			continue
 		}
 		account.Model = normalizeModelID(account.Model)
 		available = append(available, account)
 	}
 	if len(available) == 0 {
-		if matched {
-			return nil, errors.New("matching accounts are temporarily unavailable")
-		}
 		if model != "" {
 			return nil, errors.New("requested model is unavailable")
 		}
@@ -588,42 +575,6 @@ func (a *app) choose(model string) (Account, error) {
 	return accounts[0], nil
 }
 
-func (a *app) markAccountFailure(account Account, class string, latency time.Duration) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.health == nil {
-		a.health = map[string]*accountHealth{}
-	}
-	health := a.health[account.ID]
-	if health == nil {
-		health = &accountHealth{}
-		a.health[account.ID] = health
-	}
-	health.ConsecutiveFailures++
-	health.LastErrorClass = class
-	health.LastLatency = latency
-	if health.ConsecutiveFailures >= accountFailureThreshold {
-		health.CooldownUntil = time.Now().Add(accountCooldownDuration)
-	}
-}
-
-func (a *app) markAccountSuccess(account Account, latency time.Duration) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.health == nil {
-		a.health = map[string]*accountHealth{}
-	}
-	health := a.health[account.ID]
-	if health == nil {
-		health = &accountHealth{}
-		a.health[account.ID] = health
-	}
-	health.ConsecutiveFailures = 0
-	health.CooldownUntil = time.Time{}
-	health.LastErrorClass = ""
-	health.LastSuccessAt = time.Now().UTC()
-	health.LastLatency = latency
-}
 func clientAPIKey(r *http.Request) string {
 	if raw := strings.TrimSpace(r.Header.Get("Authorization")); raw != "" {
 		const prefix = "Bearer "
@@ -771,11 +722,6 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		if e != nil && !errors.Is(e, context.Canceled) {
 			log.Printf("upstream response interrupted: account_id=%s class=%s stream=%t", account.ID, result.FailureClass, isSSE)
 		}
-		if result.Outcome == outcomeSucceeded {
-			a.markAccountSuccess(account, time.Since(started))
-		} else if shouldPenalizeAccount(result) {
-			a.markAccountFailure(account, result.FailureClass, time.Since(started))
-		}
 	} else {
 		appErr(w, 502, "upstream request failed")
 	}
@@ -901,13 +847,6 @@ func classifyRequestResult(status int, isSSE bool, err error, detector *sseError
 		result.Completed = true
 	}
 	return result
-}
-
-func shouldPenalizeAccount(result requestResult) bool {
-	return result.Outcome == outcomeUpstreamSSEError ||
-		result.Outcome == outcomeUpstreamStreamInterrupted ||
-		result.Outcome == outcomeStreamIdleTimeout ||
-		(result.Outcome == outcomeUpstreamHTTPError && result.HTTPStatus >= http.StatusInternalServerError)
 }
 
 func legacyStatus(outcome string) string {

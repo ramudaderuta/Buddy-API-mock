@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -69,49 +68,77 @@ func TestCopySafeResponseHeadersAllowsDiagnosticsAndRejectsCookies(t *testing.T)
 	}
 }
 
-func TestSafeRetrySwitchesAccountsOnlyBeforeRequestWrite(t *testing.T) {
-	a := &app{key: make([]byte, 32), health: map[string]*accountHealth{}}
+func TestSafeRetryStopsAfterTenAttempts(t *testing.T) {
+	a := &app{key: make([]byte, 32)}
 	accounts := []Account{
 		encryptedTestAccount(t, a, "first", "https://first.example/v1", "model-a", "key-first"),
 		encryptedTestAccount(t, a, "second", "https://second.example/v1", "model-a", "key-second"),
 	}
-	var mu sync.Mutex
-	attempts := 0
-	var secondAuthorization string
+	var hosts []string
+	var delays []time.Duration
+	a.retryWait = func(_ context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		return true
+	}
 	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		attempts++
-		if attempts == 1 {
-			return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
-		}
-		secondAuthorization = request.Header.Get("Authorization")
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": {"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
-			Request:    request,
-		}, nil
+		hosts = append(hosts, request.URL.Host)
+		return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	_, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	if err == nil {
+		t.Fatal("expected retry exhaustion error")
+	}
+	if len(hosts) != maxSafeAttempts || used.ID != "first" {
+		t.Fatalf("hosts=%#v used=%q", hosts, used.ID)
+	}
+	for i, host := range hosts {
+		if host != "first.example" {
+			t.Fatalf("attempt %d unexpectedly switched to %q", i+1, host)
+		}
+	}
+	if len(delays) != maxSafeAttempts-1 {
+		t.Fatalf("delays=%#v", delays)
+	}
+	for i, want := range safeRetryBackoff[:maxSafeAttempts-1] {
+		if delays[i] != want {
+			t.Fatalf("delay[%d]=%v want %v", i, delays[i], want)
+		}
+	}
+}
+
+func TestSafeRetryCanSucceedOnTenthAttempt(t *testing.T) {
+	a := &app{key: make([]byte, 32)}
+	accounts := []Account{encryptedTestAccount(t, a, "only", "https://only.example/v1", "model-a", "key")}
+	var delays []time.Duration
+	a.retryWait = func(_ context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		return true
+	}
+	attempts := 0
+	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts < maxSafeAttempts {
+			return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+	})}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	response, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if attempts != 2 || used.ID != "second" || secondAuthorization != "Bearer key-second" {
-		t.Fatalf("attempts=%d used=%q auth=%q", attempts, used.ID, secondAuthorization)
+	if attempts != maxSafeAttempts || len(delays) != maxSafeAttempts-1 {
+		t.Fatalf("attempts=%d delays=%#v", attempts, delays)
 	}
-	if a.health["first"].ConsecutiveFailures != 1 {
-		t.Fatalf("first account health = %#v", a.health["first"])
-	}
-	if a.health["second"] != nil {
-		t.Fatalf("response establishment must not mark account healthy before full response: %#v", a.health["second"])
+	if delays[len(delays)-1] != maxSafeRetryDelay {
+		t.Fatalf("last delay=%v", delays[len(delays)-1])
 	}
 }
 
 func TestSafeRetryNeverReplaysAfterRequestWrite(t *testing.T) {
-	a := &app{key: make([]byte, 32), health: map[string]*accountHealth{}}
+	a := &app{key: make([]byte, 32)}
 	accounts := []Account{
 		encryptedTestAccount(t, a, "first", "https://first.example/v1", "model-a", "key-first"),
 		encryptedTestAccount(t, a, "second", "https://second.example/v1", "model-a", "key-second"),
@@ -126,19 +153,13 @@ func TestSafeRetryNeverReplaysAfterRequestWrite(t *testing.T) {
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	_, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("error = %v", err)
-	}
-	if attempts != 1 || used.ID != "first" {
-		t.Fatalf("attempts=%d used=%q", attempts, used.ID)
-	}
-	if a.health["first"] != nil {
-		t.Fatalf("ambiguous post-write failure must not enter safe-failure cooldown: %#v", a.health["first"])
+	if !errors.Is(err, io.ErrUnexpectedEOF) || attempts != 1 || used.ID != "first" {
+		t.Fatalf("error=%v attempts=%d used=%q", err, attempts, used.ID)
 	}
 }
 
-func TestHTTP503IsReturnedWithoutRetryOrHealthReset(t *testing.T) {
-	a := &app{key: make([]byte, 32), health: map[string]*accountHealth{"first": {ConsecutiveFailures: 2}}}
+func TestHTTP503IsReturnedWithoutRelayRetry(t *testing.T) {
+	a := &app{key: make([]byte, 32)}
 	accounts := []Account{
 		encryptedTestAccount(t, a, "first", "https://first.example/v1", "model-a", "key-first"),
 		encryptedTestAccount(t, a, "second", "https://second.example/v1", "model-a", "key-second"),
@@ -146,12 +167,7 @@ func TestHTTP503IsReturnedWithoutRetryOrHealthReset(t *testing.T) {
 	attempts := 0
 	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		attempts++
-		return &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Header:     http.Header{"Retry-After": {"5"}},
-			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"busy"}}`)),
-			Request:    request,
-		}, nil
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"Retry-After": {"5"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"busy"}}`)), Request: request}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
@@ -162,81 +178,50 @@ func TestHTTP503IsReturnedWithoutRetryOrHealthReset(t *testing.T) {
 	if attempts != 1 || used.ID != "first" || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("attempts=%d used=%q status=%d", attempts, used.ID, response.StatusCode)
 	}
-	if a.health["first"].ConsecutiveFailures != 2 {
-		t.Fatalf("5xx response must not reset safe-network failure state: %#v", a.health["first"])
-	}
 }
 
-func TestClientCancellationNeverRetries(t *testing.T) {
-	a := &app{key: make([]byte, 32), health: map[string]*accountHealth{}}
+func TestClientCancellationStopsRetryQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &app{key: make([]byte, 32)}
+	a.retryWait = func(_ context.Context, _ time.Duration) bool {
+		cancel()
+		return false
+	}
 	accounts := []Account{encryptedTestAccount(t, a, "first", "https://first.example/v1", "model-a", "key-first")}
 	attempts := 0
 	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		attempts++
-		return nil, context.Canceled
+		return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
 	})}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
 	_, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
 	if !errors.Is(err, context.Canceled) || attempts != 1 {
 		t.Fatalf("error=%v attempts=%d", err, attempts)
 	}
-	if a.health["first"] != nil {
-		t.Fatalf("client cancellation must not affect account health: %#v", a.health["first"])
-	}
 }
 
-func TestSafeRetryRechecksCooldownWithinSameRequest(t *testing.T) {
-	a := &app{key: make([]byte, 32), health: map[string]*accountHealth{"first": {ConsecutiveFailures: accountFailureThreshold - 1}}}
-	accounts := []Account{
-		encryptedTestAccount(t, a, "first", "https://first.example/v1", "model-a", "key-first"),
-		encryptedTestAccount(t, a, "second", "https://second.example/v1", "model-a", "key-second"),
-	}
-	var hosts []string
-	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		hosts = append(hosts, request.URL.Host)
-		if len(hosts) == 1 {
-			return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": {"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
-			Request:    request,
-		}, nil
-	})}
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if len(hosts) != 2 || hosts[0] != "first.example" || hosts[1] != "second.example" || used.ID != "second" {
-		t.Fatalf("hosts=%#v used=%q", hosts, used.ID)
-	}
-	if !a.health["first"].CooldownUntil.After(time.Now()) {
-		t.Fatalf("first account was not cooled down: %#v", a.health["first"])
-	}
-}
-
-func TestAccountCooldownExcludesRepeatedSafeFailures(t *testing.T) {
-	a := &app{health: map[string]*accountHealth{}, state: state{Accounts: []Account{
+func TestCandidateAccountsNeverSuspendsEnabledAccounts(t *testing.T) {
+	a := &app{state: state{Accounts: []Account{
 		{ID: "first", Model: "model-a", Enabled: true},
 		{ID: "second", Model: "model-a", Enabled: true},
 	}}}
-	for range accountFailureThreshold {
-		a.markAccountFailure(a.state.Accounts[0], "connect", time.Second)
-	}
 	accounts, err := a.candidateAccounts("model-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(accounts) != 1 || accounts[0].ID != "second" {
-		t.Fatalf("available accounts = %#v", accounts)
+	if len(accounts) != 2 || accounts[0].ID != "first" || accounts[1].ID != "second" {
+		t.Fatalf("available accounts=%#v", accounts)
 	}
-	if !a.health["first"].CooldownUntil.After(time.Now()) {
-		t.Fatalf("cooldown not set: %#v", a.health["first"])
+}
+
+func TestRetryDelayCapsAtSixtySeconds(t *testing.T) {
+	for i, want := range safeRetryBackoff {
+		if got := retryDelay(i); got != want {
+			t.Fatalf("retryDelay(%d)=%v want %v", i, got, want)
+		}
+	}
+	if got := retryDelay(100); got != maxSafeRetryDelay {
+		t.Fatalf("capped delay=%v", got)
 	}
 }
 
@@ -281,20 +266,19 @@ func TestClassifyRequestResultSeparatesStreamingOutcomes(t *testing.T) {
 		detector  *sseErrorDetector
 		outcome   string
 		completed bool
-		penalize  bool
 	}{
 		{name: "complete", status: 200, detector: &sseErrorDetector{sawDone: true}, outcome: outcomeSucceeded, completed: true},
 		{name: "client canceled", status: 200, err: context.Canceled, detector: &sseErrorDetector{}, outcome: outcomeClientCanceled},
-		{name: "sse error", status: 200, detector: &sseErrorDetector{failed: true}, outcome: outcomeUpstreamSSEError, penalize: true},
-		{name: "incomplete eof", status: 200, detector: &sseErrorDetector{}, outcome: outcomeUpstreamStreamInterrupted, penalize: true},
-		{name: "idle timeout", status: 200, err: context.DeadlineExceeded, detector: &sseErrorDetector{}, outcome: outcomeStreamIdleTimeout, penalize: true},
-		{name: "http error", status: 503, detector: &sseErrorDetector{}, outcome: outcomeUpstreamHTTPError, penalize: true},
+		{name: "sse error", status: 200, detector: &sseErrorDetector{failed: true}, outcome: outcomeUpstreamSSEError},
+		{name: "incomplete eof", status: 200, detector: &sseErrorDetector{}, outcome: outcomeUpstreamStreamInterrupted},
+		{name: "idle timeout", status: 200, err: context.DeadlineExceeded, detector: &sseErrorDetector{}, outcome: outcomeStreamIdleTimeout},
+		{name: "http error", status: 503, detector: &sseErrorDetector{}, outcome: outcomeUpstreamHTTPError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := classifyRequestResult(tt.status, true, tt.err, tt.detector)
-			if result.Outcome != tt.outcome || result.Completed != tt.completed || shouldPenalizeAccount(result) != tt.penalize {
-				t.Fatalf("result = %#v penalize=%t", result, shouldPenalizeAccount(result))
+			if result.Outcome != tt.outcome || result.Completed != tt.completed {
+				t.Fatalf("result = %#v", result)
 			}
 		})
 	}

@@ -396,11 +396,10 @@ func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
 	}
 }
 
-func TestChatRecordsClientCanceledStreamWithoutPenalizingAccount(t *testing.T) {
+func TestChatRecordsClientCanceledStream(t *testing.T) {
 	a, handler := testAPIApp()
 	a.dataPath = t.TempDir() + "/api-mock.json"
 	a.key = make([]byte, 32)
-	a.health = map[string]*accountHealth{}
 	a.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: &cancelingReadCloser{}, Request: request}, nil
 	})}
@@ -414,13 +413,12 @@ func TestChatRecordsClientCanceledStreamWithoutPenalizingAccount(t *testing.T) {
 	if len(a.state.Records) != 1 || a.state.Records[0].Outcome != outcomeClientCanceled || a.state.Records[0].Status != "canceled" || a.state.Records[0].Completed {
 		t.Fatalf("unexpected record: %#v", a.state.Records)
 	}
-	if a.health["account-a"] != nil {
-		t.Fatalf("client cancellation affected account health: %#v", a.health["account-a"])
-	}
 }
 
-func TestChatRecordsIncompleteSSEAndPenalizesAccount(t *testing.T) {
+func TestChatRecordsIncompleteSSEWithoutRelayRetry(t *testing.T) {
+	upstreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[]}\n\n")
 	}))
@@ -429,7 +427,6 @@ func TestChatRecordsIncompleteSSEAndPenalizesAccount(t *testing.T) {
 	a, handler := testAPIApp()
 	a.dataPath = t.TempDir() + "/api-mock.json"
 	a.key = make([]byte, 32)
-	a.health = map[string]*accountHealth{}
 	a.client = upstream.Client()
 	a.state.Accounts = []Account{encryptedTestAccount(t, a, "account-a", upstream.URL, "model-a", "upstream-key")}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
@@ -441,8 +438,8 @@ func TestChatRecordsIncompleteSSEAndPenalizesAccount(t *testing.T) {
 	if len(a.state.Records) != 1 || a.state.Records[0].Outcome != outcomeUpstreamStreamInterrupted || a.state.Records[0].FailureClass != "incomplete_sse" || a.state.Records[0].Completed {
 		t.Fatalf("unexpected record: %#v", a.state.Records)
 	}
-	if a.health["account-a"] == nil || a.health["account-a"].ConsecutiveFailures != 1 {
-		t.Fatalf("incomplete stream did not affect account health: %#v", a.health["account-a"])
+	if upstreamCalls != 1 {
+		t.Fatalf("incomplete SSE was replayed %d times", upstreamCalls)
 	}
 }
 

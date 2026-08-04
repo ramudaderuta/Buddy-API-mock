@@ -126,7 +126,8 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13100/
 - 命名卷 `api-mock-data` 保存加密账户数据，`api-mock-captures` 保存可选的轻量脱敏请求捕获；脱敏保留请求结构但替换正文、工具参数、URL、凭证字段和常见标识符，不能替代严格的数据治理，卷仍按私有数据处理。镜像为两个挂载点预置 UID/GID 65532 权限，因此主进程可始终以 nonroot 运行。普通 `docker compose down` 不会删除这些卷。
 - WorkBuddy 的 `conversation_topic` 请求由本地返回固定 SSE 标题；正式对话仍转发至已配置上游。
 - 弱网参数全部固定在程序中，不新增环境变量：连接/TLS/响应头分段超时、非流式总时限、SSE flush/heartbeat/空闲保护，以及仅限请求尚未写出阶段的安全重试。
-- 自动重试不会跨越 HTTP 响应或任何已写出的请求/响应字节；SSE 中断和工具调用不会透明重放。连续 3 次安全的 pre-write 网络失败会让账户冷却 60 秒，同模型的其他健康账户可接替后续安全尝试。
+- 一个逻辑请求最多执行 10 次安全 pre-write 尝试，前 9 次失败后按 `250ms、500ms、1s、2s、4s、8s、16s、32s、60s` 退避；第 10 次仍失败时立即返回。该序列只使用当前选定账户，不切换账户、不循环，也不维护账户冷却或暂停调度状态。
+- 自动重试不会跨越 HTTP 响应或任何已写出的请求/响应字节；HTTP 4xx/5xx、SSE error、SSE 缺少 `[DONE]`、流中断和工具调用都不会透明重放，由客户端决定是否提交新的逻辑请求。
 - Cloudflare 路径应继续禁用 `/v1/chat/completions` 缓存和响应转换；应用会为 SSE 设置 `no-cache, no-transform` 与 `X-Accel-Buffering: no` 并发送标准注释 heartbeat。
 - 管理员密码、中转 Key、可选用户标识只放在被忽略的 `deploy/.env`。
 - 真实上游 Endpoint 和 Key 只保存在本机账户池及加密数据卷，不能写入源码或 Compose。

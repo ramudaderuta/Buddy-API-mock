@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"log"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -28,12 +27,21 @@ const (
 	sseHeartbeatInterval       = 20 * time.Second
 	serverReadHeaderTimeout    = 10 * time.Second
 	serverIdleTimeout          = 120 * time.Second
-	accountCooldownDuration    = 60 * time.Second
-	accountFailureThreshold    = 3
-	maxSafeAttempts            = 3
+	maxSafeAttempts            = 10
+	maxSafeRetryDelay          = 60 * time.Second
 )
 
-var safeRetryBackoff = [...]time.Duration{250 * time.Millisecond, 750 * time.Millisecond}
+var safeRetryBackoff = [...]time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	32 * time.Second,
+	60 * time.Second,
+}
 
 func newUpstreamHTTPClient() *http.Client {
 	return &http.Client{Transport: &http.Transport{
@@ -54,21 +62,8 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 	if len(accounts) == 0 {
 		return nil, Account{}, errors.New("no upstream accounts available")
 	}
-	var lastErr error
-	var used Account
+	used := accounts[0]
 	for attempt := 0; attempt < maxSafeAttempts; attempt++ {
-		selected := false
-		for offset := 0; offset < len(accounts); offset++ {
-			candidate := accounts[(attempt+offset)%len(accounts)]
-			if !a.accountInCooldown(candidate.ID, time.Now()) {
-				used = candidate
-				selected = true
-				break
-			}
-		}
-		if !selected {
-			break
-		}
 		key, err := a.decrypt(used.Key)
 		if err != nil {
 			return nil, used, errors.New("account key unavailable")
@@ -100,27 +95,30 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 		if workBuddyCompatible {
 			a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
 		}
-		started := time.Now()
 		response, err := a.client.Do(upstream)
-		latency := time.Since(started)
 		if response != nil {
 			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
 			return response, used, nil
 		}
 		cancel()
-		lastErr = err
 		if err == nil || r.Context().Err() != nil || !trace.safeToRetry() {
 			return nil, used, err
 		}
 		class := classifyNetworkError(err)
-		a.markAccountFailure(used, class, latency)
+		if attempt+1 >= maxSafeAttempts {
+			log.Printf("upstream pre-write failure: account_id=%s class=%s attempt=%d retry_exhausted=true", used.ID, class, attempt+1)
+			return nil, used, err
+		}
 		delay := retryDelay(attempt)
 		log.Printf("upstream pre-write failure: account_id=%s class=%s attempt=%d retry_in_ms=%d", used.ID, class, attempt+1, delay.Milliseconds())
-		if attempt+1 >= maxSafeAttempts || !waitForRetry(r.Context(), delay) {
-			break
+		if !a.waitForRetry(r.Context(), delay) {
+			if canceled := r.Context().Err(); canceled != nil {
+				return nil, used, canceled
+			}
+			return nil, used, context.Canceled
 		}
 	}
-	return nil, used, lastErr
+	return nil, used, errors.New("safe retry attempts exhausted")
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {
@@ -142,21 +140,6 @@ func (body *cancelOnClose) Close() error {
 	err := body.ReadCloser.Close()
 	body.cancel()
 	return err
-}
-
-func (a *app) accountInCooldown(accountID string, now time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	health := a.health[accountID]
-	return health != nil && health.CooldownUntil.After(now)
-}
-
-type accountHealth struct {
-	ConsecutiveFailures int
-	CooldownUntil       time.Time
-	LastSuccessAt       time.Time
-	LastErrorClass      string
-	LastLatency         time.Duration
 }
 
 type attemptTrace struct {
@@ -188,13 +171,21 @@ func (t *attemptTrace) safeToRetry() bool {
 	return !t.wrote && !t.gotResponse
 }
 
-func retryDelay(attempt int) time.Duration {
-	if attempt < 0 || attempt >= len(safeRetryBackoff) {
-		return 0
+func retryDelay(accountFailure int) time.Duration {
+	if accountFailure < 0 {
+		return safeRetryBackoff[0]
 	}
-	base := safeRetryBackoff[attempt]
-	jitter := time.Duration(rand.Int64N(int64(base/5 + 1)))
-	return base + jitter
+	if accountFailure >= len(safeRetryBackoff) {
+		return maxSafeRetryDelay
+	}
+	return safeRetryBackoff[accountFailure]
+}
+
+func (a *app) waitForRetry(ctx context.Context, delay time.Duration) bool {
+	if a.retryWait != nil {
+		return a.retryWait(ctx, delay)
+	}
+	return waitForRetry(ctx, delay)
 }
 
 func waitForRetry(ctx context.Context, delay time.Duration) bool {
