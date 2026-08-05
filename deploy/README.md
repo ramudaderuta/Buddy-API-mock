@@ -123,7 +123,7 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13100/
 - `API_MOCK_MODEL_INSTRUCTIONS_FILE`：可选；容器内私有系统提示词路径，例如 `/private-profile/model_instructions.private.md`。
 - `API_MOCK_WORKBUDDY_PROFILE_FILE`：可选；容器内私有 WorkBuddy 请求头画像路径，例如 `/private-profile/workbuddy_profile.private.json`。
 - 上游 Endpoint 和 API Key 在控制台「账户池」配置；上游 Key 不写入 `.env`。
-- 命名卷 `api-mock-data` 保存加密账户数据，`api-mock-captures` 保存可选的轻量脱敏请求捕获；脱敏保留请求结构但替换正文、工具参数、URL、凭证字段和常见标识符，不能替代严格的数据治理，卷仍按私有数据处理。镜像为两个挂载点预置 UID/GID 65532 权限，因此主进程可始终以 nonroot 运行。普通 `docker compose down` 不会删除这些卷。
+- 命名卷 `api-mock-data` 保存加密账户数据，`api-mock-captures` 保存可选 capture。启用 `API_MOCK_OUTGOING_CAPTURE_DIR` 后，每个真实上游请求会保存脱敏请求结构、受白名单限制的响应头和最终结果元数据；同名 `.response` 文件保存原始上游响应体，每条最多 8 MiB，并以 profile 的 `truncated` 标记说明是否截断。响应文件可能含模型输出、工具参数/结果或错误原文，必须按私有数据处理，绝不能提交、公开、发送到公开 issue 或打包进镜像。镜像为两个挂载点预置 UID/GID 65532 权限，因此主进程可始终以 nonroot 运行。普通 `docker compose down` 不会删除这些卷。
 - WorkBuddy 的 `conversation_topic` 请求由本地返回固定 SSE 标题；正式对话仍转发至已配置上游。
 - 弱网参数全部固定在程序中，不新增环境变量：连接/TLS/响应头分段超时、非流式总时限、SSE flush/heartbeat/空闲保护，以及仅限请求尚未写出阶段的安全重试。
 - 一个逻辑请求最多执行 10 次安全 pre-write 尝试，前 9 次失败后按 `250ms、500ms、1s、2s、4s、8s、16s、32s、60s` 退避；第 10 次仍失败时立即返回。该序列只使用当前选定账户，不切换账户、不循环，也不维护账户冷却或暂停调度状态。
@@ -131,4 +131,4 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:13100/
 - Cloudflare 路径应继续禁用 `/v1/chat/completions` 缓存和响应转换；应用会为 SSE 设置 `no-cache, no-transform` 与 `X-Accel-Buffering: no` 并发送标准注释 heartbeat。
 - 管理员密码、中转 Key、可选用户标识只放在被忽略的 `deploy/.env`。
 - 真实上游 Endpoint 和 Key 只保存在本机账户池及加密数据卷，不能写入源码或 Compose。
-- 正式对话正文为实现中转所必需会发送给用户配置的上游；服务不会持久化上游响应正文。仅当显式设置 `API_MOCK_OUTGOING_CAPTURE_DIR` 时，才会持久化经过上述轻量规则脱敏的请求结构。
+- 正式对话正文为实现中转所必需会发送给用户配置的上游。仅当显式设置 `API_MOCK_OUTGOING_CAPTURE_DIR` 时，服务才会将脱敏请求结构、受限响应元数据和原始响应体写入私有 capture 卷；响应体固定上限为每条 8 MiB。

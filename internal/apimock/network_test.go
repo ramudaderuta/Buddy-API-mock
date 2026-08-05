@@ -85,7 +85,7 @@ func TestSafeRetryStopsAfterTenAttempts(t *testing.T) {
 		return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	_, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	_, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, "request-test")
 	if err == nil {
 		t.Fatal("expected retry exhaustion error")
 	}
@@ -124,7 +124,7 @@ func TestSafeRetryCanSucceedOnTenthAttempt(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, _, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	response, _, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestSafeRetryNeverReplaysAfterRequestWrite(t *testing.T) {
 		return nil, io.ErrUnexpectedEOF
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	_, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	_, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, "request-test")
 	if !errors.Is(err, io.ErrUnexpectedEOF) || attempts != 1 || used.ID != "first" {
 		t.Fatalf("error=%v attempts=%d used=%q", err, attempts, used.ID)
 	}
@@ -170,7 +170,7 @@ func TestHTTP503IsReturnedWithoutRelayRetry(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"Retry-After": {"5"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"busy"}}`)), Request: request}, nil
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	response, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	response, used, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, "request-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestClientCancellationStopsRetryQueue(t *testing.T) {
 		return nil, &net.DNSError{Err: "temporary lookup failure", Name: request.URL.Host}
 	})}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
-	_, _, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, false, "request-test")
+	_, _, _, err := a.doUpstreamRequest(request, accounts, []byte(`{"model":"model-a"}`), false, false, false, "request-test")
 	if !errors.Is(err, context.Canceled) || attempts != 1 {
 		t.Fatalf("error=%v attempts=%d", err, attempts)
 	}

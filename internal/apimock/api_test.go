@@ -412,6 +412,13 @@ func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
 	if profile.RequestID == "" || profile.Result == nil || profile.Result.Outcome != outcomeSucceeded || profile.Result.HTTPStatus != http.StatusOK || !profile.Result.Stream || !profile.Result.Completed || profile.Result.DurationMS < 0 {
 		t.Fatalf("unexpected capture profile: %#v", profile)
 	}
+	if profile.Response == nil || profile.Response.ContentType != "text/event-stream" || profile.Response.File == "" || profile.Response.BytesCaptured == 0 || profile.Response.Truncated {
+		t.Fatalf("unexpected captured response metadata: %#v", profile.Response)
+	}
+	captured, err := os.ReadFile(filepath.Join(a.outgoingCaptureDir, profile.Response.File))
+	if err != nil || string(captured) != "data: {\"choices\":[]}\n\ndata: [DONE]\n\n" {
+		t.Fatalf("captured SSE = %q, %v", captured, err)
+	}
 }
 
 func TestChatRecordsClientCanceledStream(t *testing.T) {
@@ -475,6 +482,59 @@ func TestChatRecordsIncompleteSSEWithoutRelayRetry(t *testing.T) {
 	}
 	if profile.Result == nil || profile.Result.Outcome != outcomeUpstreamStreamInterrupted || profile.Result.FailureClass != "incomplete_sse" || profile.Result.HTTPStatus != http.StatusOK || !profile.Result.Stream || profile.Result.Completed {
 		t.Fatalf("unexpected capture profile: %#v", profile)
+	}
+	if profile.Response == nil || profile.Response.File == "" || profile.Response.Truncated {
+		t.Fatalf("unexpected captured response metadata: %#v", profile.Response)
+	}
+	captured, err := os.ReadFile(filepath.Join(a.outgoingCaptureDir, profile.Response.File))
+	if err != nil || string(captured) != "data: {\"choices\":[]}\n\n" {
+		t.Fatalf("captured incomplete SSE = %q, %v", captured, err)
+	}
+}
+
+func TestChatCapturesJSONResponse(t *testing.T) {
+	const upstreamBody = `{"error":{"message":"temporary upstream failure"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	a, handler := testAPIApp()
+	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.outgoingCaptureDir = t.TempDir()
+	a.key = make([]byte, 32)
+	a.client = upstream.Client()
+	a.state.Accounts = []Account{encryptedTestAccount(t, a, "account-a", upstream.URL, "model-a", "upstream-key")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":false}`))
+	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != upstreamBody {
+		t.Fatalf("response = %d %q", response.Code, response.Body.String())
+	}
+	profiles, err := filepath.Glob(filepath.Join(a.outgoingCaptureDir, "*.profile.json"))
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("capture profiles = %#v, %v", profiles, err)
+	}
+	encoded, err := os.ReadFile(profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile outgoingCaptureProfile
+	if err := json.Unmarshal(encoded, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.Result == nil || profile.Result.Outcome != outcomeUpstreamHTTPError || profile.Result.HTTPStatus != http.StatusServiceUnavailable || profile.Result.Stream || profile.Response == nil || profile.Response.Headers["Retry-After"][0] != "30" {
+		t.Fatalf("unexpected capture profile: %#v", profile)
+	}
+	captured, err := os.ReadFile(filepath.Join(a.outgoingCaptureDir, profile.Response.File))
+	if err != nil || string(captured) != upstreamBody {
+		t.Fatalf("captured JSON = %q, %v", captured, err)
 	}
 }
 

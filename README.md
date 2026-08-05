@@ -307,9 +307,12 @@ Relay 只在已启用且配置了相同模型 ID 的账户中应用当前调度�
 - WorkBuddy 的 `conversation_topic` 请求在本地生成固定标题，不把该阶段的提示词
   转发给上游。
 - 正式 `conversation` 请求作为中转功能的一部分会实时发送到用户配置的上游；
-  响应 SSE 按字节实时透传。启用 outgoing capture 后，配对的 `.profile.json` 会写入
-  最终的安全结果摘要（结果类别、HTTP 状态、流式完成标记、耗时），不保存提示词、
-  明文密钥、上游错误原文或响应正文。
+  响应 SSE 按字节实时透传。仅在显式设置 `API_MOCK_OUTGOING_CAPTURE_DIR` 后，所有
+  真实上游请求才会创建 capture：请求 `.json` 保留脱敏结构，`.response` 保留原始上游
+  响应体（每条最多 8 MiB），配对的 `.profile.json` 记录安全响应头、文件名、截断状态和
+  最终结果摘要（结果类别、HTTP 状态、流式完成标记、耗时）。响应 capture 可能包含模型
+  输出、工具参数/结果或上游错误原文，必须仅保留在私有 capture 卷中，不能提交、公开、
+  打包进镜像或发送到公开 issue。
 - 普通 agent 调用可使用部署机的只读私有目录提供系统提示词和 WorkBuddy 请求头画像；
   `API_MOCK_PRIVATE_PROFILE_DIR` 指定宿主机目录，另外两个变量指定容器内读取路径。
   公开镜像不包含这些内容。仅允许 WorkBuddy 相关白名单头，账户池上游认证始终由服务端设置。

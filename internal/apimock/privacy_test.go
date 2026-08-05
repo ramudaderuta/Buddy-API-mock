@@ -312,6 +312,36 @@ func TestCaptureOutgoingRedactsBodyAndHeaderIdentifiers(t *testing.T) {
 	}
 }
 
+func TestCapturedResponseIsBoundedAndUsesSafeHeaders(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{outgoingCaptureDir: dir}
+	capture := a.captureOutgoing([]byte(`{"model":"model-a","messages":[]}`), map[string]string{}, "request-test", 1)
+	if capture == nil {
+		t.Fatal("capture was not created")
+	}
+	writer := capture.beginResponse(&http.Response{Header: http.Header{
+		"Content-Type": {"application/json"},
+		"Set-Cookie":   {"private=secret"},
+	}})
+	if writer == nil {
+		t.Fatal("response writer was not created")
+	}
+	if _, err := writer.Write(make([]byte, maxCapturedResponseBytes+1)); err != nil {
+		t.Fatal(err)
+	}
+	capture.recordResult(requestResult{Outcome: outcomeSucceeded, HTTPStatus: http.StatusOK, Completed: true}, false, 0)
+	if capture.profile.Response == nil || !capture.profile.Response.Truncated || capture.profile.Response.BytesCaptured != maxCapturedResponseBytes || capture.profile.Response.Headers["Content-Type"][0] != "application/json" {
+		t.Fatalf("unexpected response metadata: %#v", capture.profile.Response)
+	}
+	if _, exists := capture.profile.Response.Headers["Set-Cookie"]; exists {
+		t.Fatalf("sensitive response header was captured: %#v", capture.profile.Response.Headers)
+	}
+	info, err := os.Stat(dir + "/" + capture.profile.Response.File)
+	if err != nil || info.Size() != maxCapturedResponseBytes {
+		t.Fatalf("captured response size = %d, %v", info.Size(), err)
+	}
+}
+
 func TestPiWorkBuddyProfilePreservesToolsAndRemovesPiOnlyFields(t *testing.T) {
 	payload := map[string]any{
 		"max_completion_tokens": 128,

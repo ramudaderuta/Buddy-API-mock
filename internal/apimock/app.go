@@ -60,16 +60,31 @@ type outgoingCaptureResult struct {
 	DurationMS   int64  `json:"duration_ms"`
 }
 
+type outgoingCaptureResponse struct {
+	ContentType   string              `json:"content_type"`
+	Headers       map[string][]string `json:"headers"`
+	File          string              `json:"file,omitempty"`
+	BytesCaptured int64               `json:"bytes_captured"`
+	Truncated     bool                `json:"truncated"`
+}
+
 type outgoingCaptureProfile struct {
-	Headers   map[string]string      `json:"headers"`
-	RequestID string                 `json:"request_id"`
-	Attempt   int                    `json:"attempt"`
-	Result    *outgoingCaptureResult `json:"result,omitempty"`
+	Headers   map[string]string        `json:"headers"`
+	RequestID string                   `json:"request_id"`
+	Attempt   int                      `json:"attempt"`
+	Response  *outgoingCaptureResponse `json:"response,omitempty"`
+	Result    *outgoingCaptureResult   `json:"result,omitempty"`
 }
 
 type outgoingCapture struct {
-	profilePath string
-	profile     outgoingCaptureProfile
+	profilePath  string
+	profile      outgoingCaptureProfile
+	responseFile *os.File
+}
+
+type captureResponseWriter struct {
+	file     *os.File
+	response *outgoingCaptureResponse
 }
 
 const (
@@ -713,7 +728,7 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	body, _ = json.Marshal(request)
 	stream, _ := request["stream"].(bool)
 	logicalRequestID := randomString(12)
-	response, usedAccount, capture, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible, logicalRequestID)
+	response, usedAccount, capture, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, logicalRequestID)
 	account = usedAccount
 	result := requestResult{Outcome: outcomeRequestFailed, FailureClass: classifyNetworkError(e)}
 	if errors.Is(e, context.Canceled) {
@@ -724,6 +739,10 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	if e == nil {
 		result.HTTPStatus = response.StatusCode
 		copySafeResponseHeaders(w.Header(), response.Header)
+		body := io.Reader(response.Body)
+		if responseWriter := capture.beginResponse(response); responseWriter != nil {
+			body = io.TeeReader(response.Body, responseWriter)
+		}
 		isSSE := isSSEContentType(response.Header.Get("Content-Type"))
 		if isSSE {
 			w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -734,9 +753,9 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(response.StatusCode)
 		detector := &sseErrorDetector{}
 		if isSSE {
-			e = copySSEWithHeartbeat(r.Context(), w, response.Body, detector)
+			e = copySSEWithHeartbeat(r.Context(), w, body, detector)
 		} else {
-			_, e = io.Copy(w, response.Body)
+			_, e = io.Copy(w, body)
 		}
 		response.Body.Close()
 		result = classifyRequestResult(response.StatusCode, isSSE, e, detector)
@@ -945,6 +964,10 @@ func (capture *outgoingCapture) recordResult(result requestResult, stream bool, 
 	if capture == nil {
 		return
 	}
+	if capture.responseFile != nil {
+		_ = capture.responseFile.Close()
+		capture.responseFile = nil
+	}
 	capture.profile.Result = &outgoingCaptureResult{
 		Outcome:      result.Outcome,
 		FailureClass: result.FailureClass,
@@ -957,6 +980,49 @@ func (capture *outgoingCapture) recordResult(result requestResult, stream bool, 
 	if err == nil {
 		_ = os.WriteFile(capture.profilePath, encoded, 0o600)
 	}
+}
+
+const maxCapturedResponseBytes int64 = 8 << 20
+
+func (capture *outgoingCapture) beginResponse(response *http.Response) io.Writer {
+	if capture == nil {
+		return nil
+	}
+	responsePath := strings.TrimSuffix(capture.profilePath, ".profile.json") + ".response"
+	metadata := &outgoingCaptureResponse{
+		ContentType: response.Header.Get("Content-Type"),
+		Headers:     safeResponseHeaders(response.Header),
+	}
+	capture.profile.Response = metadata
+	file, err := os.OpenFile(responsePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil
+	}
+	capture.responseFile = file
+	metadata.File = filepath.Base(responsePath)
+	return &captureResponseWriter{file: file, response: metadata}
+}
+
+func (writer *captureResponseWriter) Write(p []byte) (int, error) {
+	if writer == nil || writer.file == nil || writer.response == nil {
+		return len(p), nil
+	}
+	remaining := maxCapturedResponseBytes - writer.response.BytesCaptured
+	if remaining <= 0 {
+		writer.response.Truncated = true
+		return len(p), nil
+	}
+	toWrite := p
+	if int64(len(toWrite)) > remaining {
+		toWrite = toWrite[:remaining]
+		writer.response.Truncated = true
+	}
+	n, err := writer.file.Write(toWrite)
+	writer.response.BytesCaptured += int64(n)
+	if err != nil || n != len(toWrite) {
+		writer.response.Truncated = true
+	}
+	return len(p), nil
 }
 
 func redactCaptureBody(body []byte) ([]byte, error) {

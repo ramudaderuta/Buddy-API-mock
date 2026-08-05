@@ -58,7 +58,7 @@ func newUpstreamHTTPClient() *http.Client {
 	}}
 }
 
-func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible bool, logicalRequestID string) (*http.Response, Account, *outgoingCapture, error) {
+func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy bool, logicalRequestID string) (*http.Response, Account, *outgoingCapture, error) {
 	if len(accounts) == 0 {
 		return nil, Account{}, nil, errors.New("no upstream accounts available")
 	}
@@ -93,9 +93,7 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 			upstream.Header.Set(name, value)
 		}
 		upstream.Header.Set("Content-Type", "application/json")
-		if workBuddyCompatible {
-			capture = a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
-		}
+		capture = a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
 		response, err := a.client.Do(upstream)
 		if response != nil {
 			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
@@ -246,14 +244,22 @@ var forwardedResponseHeaders = []string{
 }
 
 func copySafeResponseHeaders(dst, src http.Header) {
-	for _, name := range forwardedResponseHeaders {
-		if values := src.Values(name); len(values) > 0 {
-			dst.Del(name)
-			for _, value := range values {
-				dst.Add(name, value)
-			}
+	for name, values := range safeResponseHeaders(src) {
+		dst.Del(name)
+		for _, value := range values {
+			dst.Add(name, value)
 		}
 	}
+}
+
+func safeResponseHeaders(src http.Header) map[string][]string {
+	headers := make(map[string][]string)
+	for _, name := range forwardedResponseHeaders {
+		if values := src.Values(name); len(values) > 0 {
+			headers[name] = append([]string(nil), values...)
+		}
+	}
+	return headers
 }
 
 func isSSEContentType(value string) bool {
