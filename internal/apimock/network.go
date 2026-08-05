@@ -58,15 +58,16 @@ func newUpstreamHTTPClient() *http.Client {
 	}}
 }
 
-func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible bool, logicalRequestID string) (*http.Response, Account, error) {
+func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible bool, logicalRequestID string) (*http.Response, Account, *outgoingCapture, error) {
 	if len(accounts) == 0 {
-		return nil, Account{}, errors.New("no upstream accounts available")
+		return nil, Account{}, nil, errors.New("no upstream accounts available")
 	}
 	used := accounts[0]
+	var capture *outgoingCapture
 	for attempt := 0; attempt < maxSafeAttempts; attempt++ {
 		key, err := a.decrypt(used.Key)
 		if err != nil {
-			return nil, used, errors.New("account key unavailable")
+			return nil, used, capture, errors.New("account key unavailable")
 		}
 		ctx := r.Context()
 		cancel := func() {}
@@ -78,7 +79,7 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 		upstream, err := http.NewRequestWithContext(ctx, http.MethodPost, used.Endpoint+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			cancel()
-			return nil, used, err
+			return nil, used, capture, err
 		}
 		headers := workBuddyHeaders(key, a.workBuddyUserID)
 		if openAICompatible {
@@ -93,32 +94,32 @@ func (a *app) doUpstreamRequest(r *http.Request, accounts []Account, body []byte
 		}
 		upstream.Header.Set("Content-Type", "application/json")
 		if workBuddyCompatible {
-			a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
+			capture = a.captureOutgoing(body, headers, logicalRequestID, attempt+1)
 		}
 		response, err := a.client.Do(upstream)
 		if response != nil {
 			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
-			return response, used, nil
+			return response, used, capture, nil
 		}
 		cancel()
 		if err == nil || r.Context().Err() != nil || !trace.safeToRetry() {
-			return nil, used, err
+			return nil, used, capture, err
 		}
 		class := classifyNetworkError(err)
 		if attempt+1 >= maxSafeAttempts {
 			log.Printf("upstream pre-write failure: account_id=%s class=%s attempt=%d retry_exhausted=true", used.ID, class, attempt+1)
-			return nil, used, err
+			return nil, used, capture, err
 		}
 		delay := retryDelay(attempt)
 		log.Printf("upstream pre-write failure: account_id=%s class=%s attempt=%d retry_in_ms=%d", used.ID, class, attempt+1, delay.Milliseconds())
 		if !a.waitForRetry(r.Context(), delay) {
 			if canceled := r.Context().Err(); canceled != nil {
-				return nil, used, canceled
+				return nil, used, capture, canceled
 			}
-			return nil, used, context.Canceled
+			return nil, used, capture, context.Canceled
 		}
 	}
-	return nil, used, errors.New("safe retry attempts exhausted")
+	return nil, used, capture, errors.New("safe retry attempts exhausted")
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {

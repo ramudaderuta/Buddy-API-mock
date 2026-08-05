@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -358,6 +360,7 @@ func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
 
 	a, handler := testAPIApp()
 	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.outgoingCaptureDir = t.TempDir()
 	a.key = make([]byte, 32)
 	a.client = upstream.Client()
 	key, err := a.encrypt("upstream-key")
@@ -394,6 +397,21 @@ func TestChatPreservesSSEWhenClientEnablesStreaming(t *testing.T) {
 	if len(a.state.Records) != 1 || !a.state.Records[0].Stream || a.state.Records[0].Outcome != outcomeSucceeded || !a.state.Records[0].Completed {
 		t.Fatalf("unexpected record: %#v", a.state.Records)
 	}
+	profiles, err := filepath.Glob(filepath.Join(a.outgoingCaptureDir, "*.profile.json"))
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("capture profiles = %#v, %v", profiles, err)
+	}
+	encoded, err := os.ReadFile(profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile outgoingCaptureProfile
+	if err := json.Unmarshal(encoded, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.RequestID == "" || profile.Result == nil || profile.Result.Outcome != outcomeSucceeded || profile.Result.HTTPStatus != http.StatusOK || !profile.Result.Stream || !profile.Result.Completed || profile.Result.DurationMS < 0 {
+		t.Fatalf("unexpected capture profile: %#v", profile)
+	}
 }
 
 func TestChatRecordsClientCanceledStream(t *testing.T) {
@@ -426,11 +444,13 @@ func TestChatRecordsIncompleteSSEWithoutRelayRetry(t *testing.T) {
 
 	a, handler := testAPIApp()
 	a.dataPath = t.TempDir() + "/api-mock.json"
+	a.outgoingCaptureDir = t.TempDir()
 	a.key = make([]byte, 32)
 	a.client = upstream.Client()
 	a.state.Accounts = []Account{encryptedTestAccount(t, a, "account-a", upstream.URL, "model-a", "upstream-key")}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[],"stream":true}`))
 	request.Header.Set("Authorization", "Bearer "+a.apiKey)
+	request.Header.Set("X-API-Mock-WorkBuddy-Compatible", "1")
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -440,6 +460,21 @@ func TestChatRecordsIncompleteSSEWithoutRelayRetry(t *testing.T) {
 	}
 	if upstreamCalls != 1 {
 		t.Fatalf("incomplete SSE was replayed %d times", upstreamCalls)
+	}
+	profiles, err := filepath.Glob(filepath.Join(a.outgoingCaptureDir, "*.profile.json"))
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("capture profiles = %#v, %v", profiles, err)
+	}
+	encoded, err := os.ReadFile(profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile outgoingCaptureProfile
+	if err := json.Unmarshal(encoded, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.Result == nil || profile.Result.Outcome != outcomeUpstreamStreamInterrupted || profile.Result.FailureClass != "incomplete_sse" || profile.Result.HTTPStatus != http.StatusOK || !profile.Result.Stream || profile.Result.Completed {
+		t.Fatalf("unexpected capture profile: %#v", profile)
 	}
 }
 

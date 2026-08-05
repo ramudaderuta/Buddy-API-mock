@@ -51,6 +51,27 @@ type requestResult struct {
 	Completed    bool
 }
 
+type outgoingCaptureResult struct {
+	Outcome      string `json:"outcome"`
+	FailureClass string `json:"failure_class,omitempty"`
+	HTTPStatus   int    `json:"http_status"`
+	Stream       bool   `json:"stream"`
+	Completed    bool   `json:"completed"`
+	DurationMS   int64  `json:"duration_ms"`
+}
+
+type outgoingCaptureProfile struct {
+	Headers   map[string]string      `json:"headers"`
+	RequestID string                 `json:"request_id"`
+	Attempt   int                    `json:"attempt"`
+	Result    *outgoingCaptureResult `json:"result,omitempty"`
+}
+
+type outgoingCapture struct {
+	profilePath string
+	profile     outgoingCaptureProfile
+}
+
 const (
 	outcomeSucceeded                 = "succeeded"
 	outcomeClientCanceled            = "client_canceled"
@@ -692,7 +713,7 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	body, _ = json.Marshal(request)
 	stream, _ := request["stream"].(bool)
 	logicalRequestID := randomString(12)
-	response, usedAccount, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible, logicalRequestID)
+	response, usedAccount, capture, e := a.doUpstreamRequest(r, accounts, body, stream, openAICompatible, nativeWorkBuddy, workBuddyCompatible, logicalRequestID)
 	account = usedAccount
 	result := requestResult{Outcome: outcomeRequestFailed, FailureClass: classifyNetworkError(e)}
 	if errors.Is(e, context.Canceled) {
@@ -725,6 +746,7 @@ func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	} else {
 		appErr(w, 502, "upstream request failed")
 	}
+	capture.recordResult(result, stream, time.Since(started))
 	a.record(account, request, result, started)
 }
 
@@ -874,16 +896,16 @@ func (a *app) record(account Account, request map[string]any, result requestResu
 	a.mu.Unlock()
 }
 
-func (a *app) captureOutgoing(body []byte, headers map[string]string, logicalRequestID string, attempt int) {
+func (a *app) captureOutgoing(body []byte, headers map[string]string, logicalRequestID string, attempt int) *outgoingCapture {
 	if a.outgoingCaptureDir == "" {
-		return
+		return nil
 	}
 	redactedBody, err := redactCaptureBody(body)
 	if err != nil {
-		return
+		return nil
 	}
 	if os.MkdirAll(a.outgoingCaptureDir, 0o700) != nil {
-		return
+		return nil
 	}
 	stem := time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + randomString(8)
 	profile := make(map[string]string, len(headers))
@@ -898,14 +920,43 @@ func (a *app) captureOutgoing(body []byte, headers map[string]string, logicalReq
 		}
 		profile[name] = value
 	}
-	encoded, err := json.Marshal(map[string]any{"headers": profile, "request_id": logicalRequestID, "attempt": attempt})
+	capture := &outgoingCapture{
+		profilePath: filepath.Join(a.outgoingCaptureDir, stem+".profile.json"),
+		profile: outgoingCaptureProfile{
+			Headers:   profile,
+			RequestID: logicalRequestID,
+			Attempt:   attempt,
+		},
+	}
+	encoded, err := json.Marshal(capture.profile)
 	if err != nil {
-		return
+		return nil
 	}
 	if os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".json"), redactedBody, 0o600) != nil {
+		return nil
+	}
+	if os.WriteFile(capture.profilePath, encoded, 0o600) != nil {
+		return nil
+	}
+	return capture
+}
+
+func (capture *outgoingCapture) recordResult(result requestResult, stream bool, duration time.Duration) {
+	if capture == nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(a.outgoingCaptureDir, stem+".profile.json"), encoded, 0o600)
+	capture.profile.Result = &outgoingCaptureResult{
+		Outcome:      result.Outcome,
+		FailureClass: result.FailureClass,
+		HTTPStatus:   result.HTTPStatus,
+		Stream:       stream,
+		Completed:    result.Completed,
+		DurationMS:   duration.Milliseconds(),
+	}
+	encoded, err := json.Marshal(capture.profile)
+	if err == nil {
+		_ = os.WriteFile(capture.profilePath, encoded, 0o600)
+	}
 }
 
 func redactCaptureBody(body []byte) ([]byte, error) {
